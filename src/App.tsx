@@ -1,0 +1,2622 @@
+import React, { useState, useEffect } from 'react'
+import { 
+  BookOpen, 
+  Award, 
+  Calendar, 
+  Plus, 
+  ArrowRight, 
+  CheckCircle2, 
+  XCircle, 
+  Brain, 
+  Compass, 
+  Sparkles, 
+  User, 
+  LogOut, 
+  Lightbulb, 
+  Check, 
+  RotateCcw, 
+  FileText, 
+  ChevronRight,
+  TrendingUp,
+  AlertTriangle,
+  Clock,
+  Menu,
+  X
+} from 'lucide-react'
+
+// Import config and clients
+import { getSupabaseClient, isSupabaseConfigured } from './lib/supabase'
+import { 
+  extractConcepts, 
+  generateQuestions, 
+  evaluateAnswer, 
+  checkGuidedHelpGuardrail,
+  generateStudyPlanReason
+} from './lib/gemini'
+import { 
+  getDecayedMastery, 
+  getTargetDifficulty, 
+  generateStudyPlan
+} from './lib/studyLogic'
+import {
+  dbFetchSubjects,
+  dbCreateSubject,
+  dbCreateMaterial,
+  dbFetchConcepts,
+  dbCreateConcepts,
+  dbFetchQuestions,
+  dbCreateQuestions,
+  dbFetchAttempts,
+  dbCreateAttempt,
+  dbFetchMastery,
+  dbUpdateMastery,
+  dbFetchStudyPlan,
+  dbSaveStudyPlan,
+  dbToggleStudyPlanItemCompleted,
+  seedMockData,
+  dbFetchUserProfile,
+  dbFetchTests,
+  dbFetchEnrolledTests,
+  dbSaveUserProfile,
+  dbCreateTestAttempt,
+  dbSubmitTestGrade,
+  dbJoinTestByCode,
+  dbCreateTest,
+  dbFetchTestScores,
+  dbUpdateUserProfile
+} from './lib/db'
+import type {
+  Subject,
+  Concept,
+  Question,
+  Attempt,
+  Mastery,
+  StudyPlanItem,
+  Test,
+  TestStudent,
+  UserProfile
+} from './lib/db'
+import { extractTextFromFile } from './lib/fileParser'
+
+
+export default function App() {
+  // --- STATE ---
+  const [isDemoMode] = useState(!isSupabaseConfigured())
+  const [session, setSession] = useState<{ user: { id: string; email: string } } | null>(null)
+  const [userRole, setUserRole] = useState<'teacher' | 'student' | null>(null)
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null)
+  
+  // Auth Form State
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [isSignUp, setIsSignUp] = useState(false)
+  const [signUpRole, setSignUpRole] = useState<'teacher' | 'student'>('student')
+  const [authError, setAuthError] = useState('')
+  const [authLoading, setAuthLoading] = useState(false)
+
+  // Navigation State
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'study' | 'progress' | 'studyplan' | 'tests' | 'profile'>('dashboard')
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+
+  // Test states
+  const [tests, setTests] = useState<Test[]>([])
+  const [enrolledTests, setEnrolledTests] = useState<TestStudent[]>([])
+  const [activeTest, setActiveTest] = useState<Test | null>(null)
+  const [joinTestCode, setJoinTestCode] = useState('')
+  const [isJoiningTest, setIsJoiningTest] = useState(false)
+  const [isCreatingTest, setIsCreatingTest] = useState(false)
+  const [newTestTitle, setNewTestTitle] = useState('')
+  const [newTestSubjectId, setNewTestSubjectId] = useState('')
+  const [newTestQuestionCount, setNewTestQuestionCount] = useState(5)
+  const [newTestDisableGuidance, setNewTestDisableGuidance] = useState(false)
+
+  // Core Data State
+  const [subjects, setSubjects] = useState<Subject[]>([])
+  const [currentSubject, setCurrentSubject] = useState<Subject | null>(null)
+  const [concepts, setConcepts] = useState<Concept[]>([])
+  const [currentConcept, setCurrentConcept] = useState<Concept | null>(null)
+  const [masteries, setMasteries] = useState<Mastery[]>([])
+  const [studyPlanItems, setStudyPlanItems] = useState<StudyPlanItem[]>([])
+  const [attempts, setAttempts] = useState<Attempt[]>([])
+  
+  // Modal states for adding subjects without blocking prompt
+  const [isAddSubjectModalOpen, setIsAddSubjectModalOpen] = useState(false)
+  const [modalSubjectName, setModalSubjectName] = useState('')
+
+  // Quiz Session State
+  const [isPracticing, setIsPracticing] = useState(false)
+  const [quizQuestions, setQuizQuestions] = useState<Question[]>([])
+  const [activeQuestionIdx, setActiveQuestionIdx] = useState(0)
+  const [studentAnswer, setStudentAnswer] = useState('')
+  const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false)
+  const [quizFeedback, setQuizFeedback] = useState<{ is_correct: boolean; feedback: string } | null>(null)
+  const [masteryChange, setMasteryChange] = useState<number | null>(null)
+  const [testCorrectCount, setTestCorrectCount] = useState(0)
+  const [flashcardRevealed, setFlashcardRevealed] = useState(false)
+
+  // Creation/Form States
+  const [newSubjectName, setNewSubjectName] = useState('')
+  const [isCreatingSubject, setIsCreatingSubject] = useState(false)
+  
+  const [materialTitle, setMaterialTitle] = useState('')
+  const [rawText, setRawText] = useState('')
+  const [sourceType, setSourceType] = useState<'paste' | 'upload' | 'topic_only'>('paste')
+  const [topicOnlyName, setTopicOnlyName] = useState('')
+  const [isAddingMaterial, setIsAddingMaterial] = useState(false)
+  const [materialLoadingState, setMaterialLoadingState] = useState<string>('') // loading description
+  
+  // Study view control
+  const [explainSimpler, setExplainSimpler] = useState(false)
+
+  // Guardrail Warning State
+  const [guardrailWarning, setGuardrailWarning] = useState<{ originalInput: string; guidance: string } | null>(null)
+
+  // Study Plan setting
+  const [studyMinutesBudget, setStudyMinutesBudget] = useState(60)
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false)
+
+  // Global Alert
+  const [globalError, setGlobalError] = useState('')
+
+  // --- INITIALIZE & AUTH LISTENER ---
+  useEffect(() => {
+    if (isDemoMode) {
+      // Simulate login in demo mode or read from localStorage
+      const cachedSession = localStorage.getItem('study_demo_session')
+      if (cachedSession) {
+        setSession(JSON.parse(cachedSession))
+      } else {
+        const defaultSession = { user: { id: '00000000-0000-0000-0000-000000000000', email: 'student@mystudy.ai' } }
+        localStorage.setItem('study_demo_session', JSON.stringify(defaultSession))
+        setSession(defaultSession)
+      }
+      seedMockData()
+    } else {
+      // Supabase Live Auth setup
+      const supabase = getSupabaseClient()
+      if (supabase) {
+        supabase.auth.getSession().then(({ data: { session } }) => {
+          if (session) {
+            setSession({ user: { id: session.user.id, email: session.user.email || '' } })
+          } else {
+            setSession(null)
+          }
+        })
+
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+          if (session) {
+            setSession({ user: { id: session.user.id, email: session.user.email || '' } })
+          } else {
+            setSession(null)
+          }
+        })
+
+        return () => subscription.unsubscribe()
+      }
+    }
+  }, [isDemoMode])
+
+  // Reload data whenever session changes, or demo mode changes, or active tab changes
+  useEffect(() => {
+    if (session) {
+      loadUserData()
+    }
+  }, [session, activeTab, isDemoMode])
+
+  // --- LOAD DATA FROM DB ---
+  const loadUserData = async () => {
+    if (!session) return
+    try {
+      const uId = session.user.id
+
+      // Fetch user profile to check the role
+      const profile = await dbFetchUserProfile(uId)
+      setUserProfile(profile)
+      setUserRole(profile.role)
+
+      if (profile.role === 'teacher') {
+        const fetchedSubjects = await dbFetchSubjects(uId)
+        setSubjects(fetchedSubjects)
+
+        // Set default subject if none selected
+        if (fetchedSubjects.length > 0 && !currentSubject) {
+          setCurrentSubject(fetchedSubjects[0])
+        }
+
+        const fetchedTests = await dbFetchTests(uId, 'teacher')
+        setTests(fetchedTests)
+      } else {
+        // Student role
+        const fetchedEnrolled = await dbFetchEnrolledTests(uId)
+        setEnrolledTests(fetchedEnrolled)
+
+        // Fetch tests to extract subjects for student
+        const fetchedTests = await dbFetchTests(uId, 'student')
+        setTests(fetchedTests)
+
+        // Fetch subjects associated with enrolled tests OR created by the student
+        const fetchedSubjects = await dbFetchSubjects(uId) // will fetch all visible subjects thanks to RLS policy
+        const uniqueSubjectIds = Array.from(new Set(fetchedTests.map((t: Test) => t.subject_id)))
+        const filteredSubjects = fetchedSubjects.filter((s: Subject) => uniqueSubjectIds.includes(s.id) || s.user_id === uId)
+        setSubjects(filteredSubjects)
+
+        if (filteredSubjects.length > 0 && !currentSubject) {
+          setCurrentSubject(filteredSubjects[0])
+        }
+      }
+
+      // Fetch global progress and plans
+      const fetchedMastery = await dbFetchMastery(uId)
+      setMasteries(fetchedMastery)
+
+      const fetchedPlans = await dbFetchStudyPlan(uId)
+      setStudyPlanItems(fetchedPlans)
+
+      const fetchedAttempts = await dbFetchAttempts(uId)
+      setAttempts(fetchedAttempts)
+    } catch (err: any) {
+      console.error(err)
+      setGlobalError(err.message || 'Failed to load user data')
+    }
+  }
+
+  // Load subject-specific details when currentSubject changes
+  useEffect(() => {
+    if (currentSubject) {
+      loadSubjectDetails(currentSubject.id)
+    } else {
+      setConcepts([])
+      setCurrentConcept(null)
+    }
+  }, [currentSubject, session])
+
+  const loadSubjectDetails = async (subId: string) => {
+    try {
+      const fetchedConcepts = await dbFetchConcepts(subId)
+      setConcepts(fetchedConcepts)
+
+      if (fetchedConcepts.length > 0) {
+        setCurrentConcept(fetchedConcepts[0])
+      } else {
+        setCurrentConcept(null)
+      }
+    } catch (err: any) {
+      console.error(err)
+      setGlobalError('Failed to load subject materials')
+    }
+  }
+
+  // --- AUTH OPERATIONS ---
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setAuthError('')
+    setAuthLoading(true)
+
+    if (isDemoMode) {
+      // Simulate auth in demo mode
+      const isTeacher = authEmail.toLowerCase().includes('teacher') || signUpRole === 'teacher';
+      const role = isTeacher ? 'teacher' : 'student';
+      const uId = isTeacher ? 'teacher-demo-id' : 'student-demo-id';
+      
+      const simulatedSession = { user: { id: uId, email: authEmail || (isTeacher ? 'teacher@mystudy.ai' : 'student@mystudy.ai') } }
+      localStorage.setItem('study_demo_session', JSON.stringify(simulatedSession))
+      
+      // Save profile in mock localStorage
+      await dbSaveUserProfile(simulatedSession.user.id, simulatedSession.user.email, role)
+      
+      setSession(simulatedSession)
+      setAuthLoading(false)
+      return
+    }
+
+    const supabase = getSupabaseClient()
+    if (!supabase) {
+      setAuthError('Supabase is not configured yet.')
+      setAuthLoading(false)
+      return
+    }
+
+    try {
+      if (isSignUp) {
+        const { data, error } = await supabase.auth.signUp({
+          email: authEmail,
+          password: authPassword,
+          options: {
+            data: {
+              role: signUpRole
+            }
+          }
+        })
+        if (error) throw error
+        if (data.user) {
+          await dbSaveUserProfile(data.user.id, authEmail, signUpRole)
+          alert('Sign up successful! Please check your email for verification (if enabled) or log in.')
+          setIsSignUp(false)
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authEmail,
+          password: authPassword,
+        })
+        if (error) throw error
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Authentication failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handleLogout = async () => {
+    if (isDemoMode) {
+      localStorage.removeItem('study_demo_session')
+      setSession(null)
+    } else {
+      const supabase = getSupabaseClient()
+      if (supabase) {
+        await supabase.auth.signOut()
+        setSession(null)
+      }
+    }
+    // Clear state
+    setSubjects([])
+    setCurrentSubject(null)
+    setConcepts([])
+    setCurrentConcept(null)
+    setMasteries([])
+    setStudyPlanItems([])
+    setAttempts([])
+  }
+
+  // --- CREATION OPERATIONS ---
+  const handleCreateSubject = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!session || !newSubjectName.trim()) return
+    setIsCreatingSubject(true)
+    try {
+      const newSub = await dbCreateSubject(session.user.id, newSubjectName.trim())
+      setSubjects(prev => [newSub, ...prev])
+      setCurrentSubject(newSub)
+      setNewSubjectName('')
+      alert(`Subject "${newSub.name}" created! Now add your study material to extract concepts.`)
+    } catch (err: any) {
+      alert(err.message || 'Failed to create subject')
+    } finally {
+      setIsCreatingSubject(false)
+    }
+  }
+
+  const handleModalCreateSubject = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!session || !modalSubjectName.trim()) return
+    setIsCreatingSubject(true)
+    try {
+      const newSub = await dbCreateSubject(session.user.id, modalSubjectName.trim())
+      setSubjects(prev => [newSub, ...prev])
+      setCurrentSubject(newSub)
+      setModalSubjectName('')
+      setIsAddSubjectModalOpen(false)
+      alert(`Subject "${newSub.name}" created! Now select it and add study material.`)
+    } catch (err: any) {
+      alert(err.message || 'Failed to create subject')
+    } finally {
+      setIsCreatingSubject(false)
+    }
+  }
+
+  // File Upload parser (client side reader)
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    
+    const title = file.name.replace(/\.[^/.]+$/, "")
+    setMaterialTitle(title)
+    setRawText("Reading and parsing document, please wait...")
+    
+    try {
+      const text = await extractTextFromFile(file)
+      setRawText(text)
+    } catch (err: any) {
+      console.error(err)
+      alert(err.message || "Failed to extract text from file.")
+      setRawText("")
+      setMaterialTitle("")
+    }
+  }
+
+  const handleAddMaterial = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!currentSubject || !session) return
+    
+    let contentToSubmit = ''
+    let titleToSubmit = ''
+
+    if (sourceType === 'topic_only') {
+      if (!topicOnlyName.trim()) return
+      titleToSubmit = topicOnlyName.trim()
+      contentToSubmit = `Study materials and concepts related to the topic of ${topicOnlyName.trim()}.`
+    } else {
+      if (!rawText.trim()) return
+      contentToSubmit = rawText.trim()
+      titleToSubmit = materialTitle.trim() || `Material - ${new Date().toLocaleDateString()}`
+    }
+
+    setIsAddingMaterial(true)
+    setMaterialLoadingState('Step 1: Running educational guardrail check...')
+    setGuardrailWarning(null)
+
+    try {
+      // Check Guided-Help Guardrail
+      const guardrail = await checkGuidedHelpGuardrail(contentToSubmit)
+      if (guardrail.isAssignment) {
+        // Block creation, trigger guidance view
+        setGuardrailWarning({
+          originalInput: contentToSubmit,
+          guidance: guardrail.guidance || "It looks like you've uploaded an assignment. Let's work through this step by step."
+        })
+        setIsAddingMaterial(false)
+        return
+      }
+
+      // Proceed with creation
+      setMaterialLoadingState('Step 2: Saving material details...')
+      const newMat = await dbCreateMaterial(currentSubject.id, titleToSubmit, contentToSubmit, sourceType)
+      
+      setMaterialLoadingState('Step 3: AI is extracting key study concepts (using Gemini)...')
+      const extracted = await extractConcepts(contentToSubmit)
+
+      if (extracted.length === 0) {
+        throw new Error('No concepts could be extracted from this material. Try providing more detailed text.')
+      }
+
+      setMaterialLoadingState('Step 4: Creating study concepts...')
+      const newConcepts = await dbCreateConcepts(extracted, newMat.id, currentSubject.id)
+
+      setMaterialLoadingState('Step 5: Pre-generating practice questions per concept...')
+      // Generate questions for each extracted concept in the background
+      for (const concept of newConcepts) {
+        try {
+          const matchingConcept = extracted.find(e => e.name.toLowerCase() === concept.name.toLowerCase())
+          const summary = matchingConcept ? matchingConcept.summary : concept.summary
+          const generatedQs = await generateQuestions(concept.name, summary)
+          if (generatedQs.length > 0) {
+            await dbCreateQuestions(generatedQs, concept.id)
+          }
+        } catch (qErr) {
+          console.error(`Failed to pre-generate questions for concept "${concept.name}":`, qErr)
+        }
+      }
+
+      // Reset Form State
+      setRawText('')
+      setMaterialTitle('')
+      setTopicOnlyName('')
+      
+      // Reload UI Data
+      await loadSubjectDetails(currentSubject.id)
+      await loadUserData()
+      
+      alert(`Success! Extracted ${newConcepts.length} concepts and generated practice questions. You can start practicing!`)
+    } catch (err: any) {
+      console.error(err)
+      alert(err.message || 'Failed to process study material')
+    } finally {
+      setIsAddingMaterial(false)
+      setMaterialLoadingState('')
+    }
+  }
+
+  // --- PRACTICE / QUIZ FLOW ---
+  const startPractice = async (concept: Concept) => {
+    setIsPracticing(true)
+    setQuizQuestions([])
+    setActiveQuestionIdx(0)
+    setStudentAnswer('')
+    setQuizFeedback(null)
+    setMasteryChange(null)
+    setFlashcardRevealed(false)
+
+    try {
+      // Find questions
+      let qs = await dbFetchQuestions(concept.id)
+      
+      // If no questions exist, generate them now
+      if (qs.length === 0) {
+        alert('Generating practice questions for this concept...')
+        const generatedQs = await generateQuestions(concept.name, concept.summary)
+        qs = await dbCreateQuestions(generatedQs, concept.id)
+      }
+
+      // Filter by dynamic difficulty: target = round(mastery_score / 20) clamped to 1-5, search within ±1
+      const conceptMastery = masteries.find(m => m.concept_id === concept.id)
+      const currentScore = conceptMastery ? getDecayedMastery(conceptMastery.score, conceptMastery.last_updated) : 50
+      const targetDiff = getTargetDifficulty(currentScore)
+      
+      // Filter questions within targetDiff ± 1
+      let filteredQs = qs.filter(q => Math.abs(q.difficulty - targetDiff) <= 1)
+      
+      // If no questions match the target range, fallback to all questions
+      if (filteredQs.length === 0) {
+        filteredQs = qs
+      }
+
+      // Shuffle a max of 5 questions for this session
+      const shuffled = [...filteredQs].sort(() => 0.5 - Math.random()).slice(0, 5)
+      setQuizQuestions(shuffled)
+      setCurrentConcept(concept)
+    } catch (err: any) {
+      console.error(err)
+      alert('Could not start practice session: ' + err.message)
+      setIsPracticing(false)
+    }
+  }
+
+  const handleAnswerSubmit = async () => {
+    if (!session || quizQuestions.length === 0) return
+    const activeQ = quizQuestions[activeQuestionIdx]
+    const uId = session.user.id
+    
+    setIsSubmittingAnswer(true)
+    setMasteryChange(null)
+
+    try {
+      let isCorrect = false
+      let feedbackText = ''
+
+      if (activeQ.question_type === 'flashcard') {
+        // Flashcard is graded manually by the student using the buttons
+        // Handled in a separate function
+        return
+      }
+
+      // MCQ or Short Answer: Grade via AI
+      const grading = await evaluateAnswer(activeQ.prompt, activeQ.correct_answer, studentAnswer.trim())
+      isCorrect = grading.is_correct
+      feedbackText = grading.feedback
+
+      if (activeTest) {
+        // Record test attempt
+        await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, studentAnswer, isCorrect, feedbackText)
+        
+        let newCorrectCount = testCorrectCount
+        if (isCorrect) {
+          newCorrectCount = testCorrectCount + 1
+          setTestCorrectCount(newCorrectCount)
+        }
+
+        // If guidance is disabled, we skip displaying feedback and immediately go to next question
+        if (activeTest.disable_guidance) {
+          if (activeQuestionIdx + 1 < quizQuestions.length) {
+            setActiveQuestionIdx(prev => prev + 1)
+            setStudentAnswer('')
+            setQuizFeedback(null)
+          } else {
+            // Test completed!
+            const finalScore = Math.round((newCorrectCount / quizQuestions.length) * 100)
+            await dbSubmitTestGrade(uId, activeTest.id, finalScore)
+            
+            // Show score page
+            setQuizFeedback({
+              is_correct: finalScore >= 50,
+              feedback: `Test Completed! You scored ${finalScore}% (${newCorrectCount} / ${quizQuestions.length} correct answers).`
+            })
+          }
+          setIsSubmittingAnswer(false)
+          return
+        }
+      } else if (currentConcept) {
+        // Self-study Concept practice attempt
+        await dbCreateAttempt(uId, activeQ.id, studentAnswer, isCorrect, feedbackText)
+
+        // Update Mastery Score (+8 if correct, -15 if incorrect)
+        const conceptMastery = masteries.find(m => m.concept_id === currentConcept.id)
+        const oldScore = conceptMastery ? conceptMastery.score : 50
+        const updatedMastery = await dbUpdateMastery(uId, currentConcept.id, isCorrect)
+        
+        // Calculate delta
+        setMasteryChange(updatedMastery.score - oldScore)
+      }
+
+      setQuizFeedback({ is_correct: isCorrect, feedback: feedbackText })
+
+      // Reload global masteries
+      loadUserData()
+    } catch (err: any) {
+      console.error(err)
+      alert('Error submitting answer: ' + err.message)
+    } finally {
+      setIsSubmittingAnswer(false)
+    }
+  }
+
+  const handleFlashcardGrade = async (isCorrect: boolean) => {
+    if (!session || quizQuestions.length === 0) return
+    const activeQ = quizQuestions[activeQuestionIdx]
+    const uId = session.user.id
+    
+    setIsSubmittingAnswer(true)
+    setMasteryChange(null)
+
+    try {
+      const feedbackText = isCorrect 
+        ? "Excellent recall! You confirmed understanding of this flashcard term."
+        : "No problem. Review this term again. Try summarizing it in your own words next time."
+
+      if (activeTest) {
+        await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, '[Self Graded Flashcard]', isCorrect, feedbackText)
+        let newCorrectCount = testCorrectCount
+        if (isCorrect) {
+          newCorrectCount = testCorrectCount + 1
+          setTestCorrectCount(newCorrectCount)
+        }
+
+        if (activeTest.disable_guidance) {
+          if (activeQuestionIdx + 1 < quizQuestions.length) {
+            setActiveQuestionIdx(prev => prev + 1)
+            setStudentAnswer('')
+            setQuizFeedback(null)
+            setFlashcardRevealed(false)
+          } else {
+            const finalScore = Math.round((newCorrectCount / quizQuestions.length) * 100)
+            await dbSubmitTestGrade(uId, activeTest.id, finalScore)
+            setQuizFeedback({
+              is_correct: finalScore >= 50,
+              feedback: `Test Completed! You scored ${finalScore}% (${newCorrectCount} / ${quizQuestions.length} correct answers).`
+            })
+          }
+          setIsSubmittingAnswer(false)
+          return
+        }
+      } else if (currentConcept) {
+        await dbCreateAttempt(uId, activeQ.id, '[Self Graded Flashcard]', isCorrect, feedbackText)
+        const conceptMastery = masteries.find(m => m.concept_id === currentConcept.id)
+        const oldScore = conceptMastery ? conceptMastery.score : 50
+        const updatedMastery = await dbUpdateMastery(uId, currentConcept.id, isCorrect)
+        setMasteryChange(updatedMastery.score - oldScore)
+      }
+
+      setQuizFeedback({ is_correct: isCorrect, feedback: feedbackText })
+      loadUserData()
+    } catch (err: any) {
+      console.error(err)
+      alert(err.message || 'Error updating score')
+    } finally {
+      setIsSubmittingAnswer(false)
+    }
+  }
+
+  const handleNextQuizQuestion = () => {
+    if (!session) return
+    const uId = session.user.id
+    if (activeTest) {
+      // If we are currently showing the test score feedback (test is complete)
+      const isTestCompleteFeedback = quizFeedback && quizFeedback.feedback.includes("Test Completed!")
+      if (isTestCompleteFeedback) {
+        setIsPracticing(false)
+        setActiveTest(null)
+        setQuizFeedback(null)
+        setTestCorrectCount(0)
+        setActiveQuestionIdx(0)
+        setStudentAnswer('')
+        loadUserData()
+        return
+      }
+
+      // If guidance is enabled, we show feedback between questions. Proceed to next question:
+      if (activeQuestionIdx + 1 < quizQuestions.length) {
+        setActiveQuestionIdx(prev => prev + 1)
+        setStudentAnswer('')
+        setQuizFeedback(null)
+        setFlashcardRevealed(false)
+      } else {
+        // Last question submitted, calculate grade and show test complete screen
+        const finalScore = Math.round((testCorrectCount / quizQuestions.length) * 100)
+        dbSubmitTestGrade(uId, activeTest.id, finalScore).then(() => {
+          setQuizFeedback({
+            is_correct: finalScore >= 50,
+            feedback: `Test Completed! You scored ${finalScore}% (${testCorrectCount} / ${quizQuestions.length} correct answers).`
+          })
+        })
+      }
+    } else {
+      if (activeQuestionIdx + 1 < quizQuestions.length) {
+        setActiveQuestionIdx(prev => prev + 1)
+        setStudentAnswer('')
+        setQuizFeedback(null)
+        setMasteryChange(null)
+        setFlashcardRevealed(false)
+      } else {
+        // Quiz finished!
+        setIsPracticing(false)
+        alert('Practice session complete! Check your progress dashboard to see how your mastery scores have updated.')
+        loadUserData()
+      }
+    }
+  }
+
+  // --- STUDY PLAN GENERATION ---
+  const handleGenerateStudyPlan = async () => {
+    if (!session) return
+    setIsGeneratingPlan(true)
+    try {
+      // Build concept list for algorithm
+      // Get all concepts across all subjects to schedule
+      const allConcepts: Concept[] = []
+      for (const sub of subjects) {
+        const subConcepts = await dbFetchConcepts(sub.id)
+        allConcepts.push(...subConcepts)
+      }
+
+      if (allConcepts.length === 0) {
+        alert('Please add some study materials and extract concepts first.')
+        setIsGeneratingPlan(false)
+        return
+      }
+
+      const conceptsWithScores = allConcepts.map(c => {
+        const m = masteries.find(ma => ma.concept_id === c.id)
+        // Apply decay dynamically
+        const decayedScore = m ? getDecayedMastery(m.score, m.last_updated) : 50
+        return {
+          id: c.id,
+          name: c.name,
+          score: decayedScore
+        }
+      })
+
+      // Generate base study plan using deterministic algorithm
+      const planDraft = generateStudyPlan(conceptsWithScores, studyMinutesBudget)
+
+      // Find the weakest concept overall
+      const weakestId = planDraft[0]?.concept_id
+
+      // Call Gemini in parallel to generate personalized, encouraging explanations for today's recommended topics
+      const finalizedItems = await Promise.all(
+        planDraft.map(async (item) => {
+          try {
+            const isWeakest = item.concept_id === weakestId
+            const conceptScore = conceptsWithScores.find(c => c.id === item.concept_id)?.score || 50
+            const reason = await generateStudyPlanReason(item.concept_name, conceptScore, isWeakest)
+            return {
+              ...item,
+              ai_reason: reason
+            }
+          } catch (reasonErr) {
+            return {
+              ...item,
+              ai_reason: 'Important focus area for conceptual balance.'
+            }
+          }
+        })
+      )
+
+      // Save plan items to DB
+      await dbSaveStudyPlan(session.user.id, finalizedItems)
+
+      // Reload
+      const fetchedPlans = await dbFetchStudyPlan(session.user.id)
+      setStudyPlanItems(fetchedPlans)
+      alert(`Successfully generated a personalized ${studyMinutesBudget}-minute study schedule!`)
+    } catch (err: any) {
+      console.error(err)
+      alert('Failed to generate study plan: ' + err.message)
+    } finally {
+      setIsGeneratingPlan(false)
+    }
+  }
+
+  const handleTogglePlanItem = async (itemId: string, completed: boolean) => {
+    try {
+      await dbToggleStudyPlanItemCompleted(itemId, completed)
+      setStudyPlanItems(prev => prev.map(item => item.id === itemId ? { ...item, completed } : item))
+    } catch (err: any) {
+      console.error(err)
+    }
+  }
+
+
+
+  // --- UTILITY RENDERERS ---
+
+  // Overall subject mastery (average of concepts)
+  const getSubjectMasteryMetrics = (subId: string) => {
+    const subConcepts = concepts.filter(c => c.subject_id === subId)
+    if (subConcepts.length === 0) return { avg: 50, weakest: null, weakestScore: null }
+    
+    let totalScore = 0
+    let weakestConcept: Concept | null = null
+    let weakestScore = 101
+
+    subConcepts.forEach(c => {
+      const m = masteries.find(ma => ma.concept_id === c.id)
+      const decayedScore = m ? getDecayedMastery(m.score, m.last_updated) : 50
+      totalScore += decayedScore
+
+      if (decayedScore < weakestScore) {
+        weakestScore = decayedScore
+        weakestConcept = c
+      }
+    })
+
+    return {
+      avg: Math.round(totalScore / subConcepts.length),
+      weakest: weakestConcept ? (weakestConcept as Concept).name : null,
+      weakestScore: weakestConcept ? weakestScore : null
+    }
+  }
+
+  // --- VIEW RENDERING ---
+
+  // Auth Screen
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 font-sans">
+        <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
+          <div className="inline-flex items-center justify-center p-1 bg-white rounded-3xl shadow-lg mb-4 border border-slate-100">
+            <img src="/logo.png" className="h-20 w-20 object-contain rounded-2xl" alt="Mystudy Logo" />
+          </div>
+          <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight">Mystudy</h2>
+          <p className="mt-2 text-sm text-slate-600">
+            Your Socratic, AI-powered active learning mentor
+          </p>
+        </div>
+
+        <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
+          <div className="bg-white py-8 px-4 shadow-md sm:rounded-2xl sm:px-10 border border-slate-100">
+            {authError && (
+              <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-600 rounded-lg p-3 text-sm flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleAuth} className="space-y-5">
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Email Address</label>
+                <input
+                  type="email"
+                  required
+                  placeholder="student@learning.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-violet-500 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Password</label>
+                <input
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-violet-500 text-sm"
+                />
+              </div>
+
+              {isSignUp && (
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1.5">Select Role</label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSignUpRole('student')}
+                      className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                        signUpRole === 'student'
+                          ? 'border-violet-600 bg-violet-50 text-violet-700 shadow-sm'
+                          : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                      }`}
+                    >
+                      I am a Student / Worker
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSignUpRole('teacher')}
+                      className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                        signUpRole === 'teacher'
+                          ? 'border-violet-600 bg-violet-50 text-violet-700 shadow-sm'
+                          : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                      }`}
+                    >
+                      I am a Teacher / Instructor
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  disabled={authLoading}
+                  className="w-full flex justify-center py-2.5 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  {authLoading ? 'Loading...' : isSignUp ? 'Sign Up' : 'Log In'}
+                </button>
+              </div>
+            </form>
+
+            <div className="mt-6 flex flex-col items-center gap-3">
+              <button
+                onClick={() => setIsSignUp(!isSignUp)}
+                className="text-sm text-violet-600 hover:text-violet-500 font-medium cursor-pointer"
+              >
+                {isSignUp ? 'Already have an account? Log In' : "Don't have an account? Sign Up"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // Layout with sidebar
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row font-sans">
+      
+      {/* GLOBAL ERROR BANNER */}
+      {globalError && (
+        <div className="fixed bottom-4 right-4 max-w-sm z-50 bg-rose-600 text-white rounded-xl shadow-2xl p-4 flex items-start gap-3">
+          <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
+          <div className="flex-1 text-sm">
+            <h4 className="font-bold">Error Occurred</h4>
+            <p className="opacity-90">{globalError}</p>
+            <button 
+              onClick={() => setGlobalError('')} 
+              className="mt-2 text-xs bg-white text-rose-600 px-2 py-1 rounded font-semibold hover:bg-opacity-90"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* MOBILE HEADER */}
+      <header className="md:hidden bg-white border-b border-slate-200 px-4 py-3 flex justify-between items-center w-full shadow-sm">
+        <div className="flex items-center gap-2">
+          <img src="/logo.png" className="h-7 w-7 object-contain rounded-md" alt="Mystudy Logo" />
+          <span className="font-bold text-slate-800 text-lg">Mystudy</span>
+        </div>
+        <button
+          onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+          className="text-slate-600 focus:outline-none"
+        >
+          {mobileMenuOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
+        </button>
+      </header>
+
+      {/* SIDEBAR NAVIGATION */}
+      <aside className={`
+        fixed inset-y-0 left-0 z-40 w-64 bg-white border-r border-slate-200 flex flex-col shadow-sm transition-transform md:translate-x-0 md:static md:h-screen
+        ${mobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}
+      `}>
+        <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="p-0.5 bg-white border border-slate-100 rounded-xl">
+              <img src="/logo.png" className="h-8 w-8 object-contain rounded-lg" alt="Mystudy Logo" />
+            </div>
+            <span className="font-bold text-slate-900 text-lg">Mystudy</span>
+          </div>
+          <button className="md:hidden text-slate-400" onClick={() => setMobileMenuOpen(false)}>
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* NAVIGATION LINKS */}
+        <nav className="flex-1 px-4 py-4 space-y-1.5 overflow-y-auto">
+          {userRole === 'teacher' ? (
+            <>
+              <button
+                onClick={() => { setActiveTab('dashboard'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'dashboard' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <Compass className={`h-5 w-5 ${activeTab === 'dashboard' ? 'text-white' : 'text-slate-500'}`} />
+                Dashboard
+              </button>
+
+              <button
+                onClick={() => { setActiveTab('study'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'study' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <BookOpen className={`h-5 w-5 ${activeTab === 'study' ? 'text-white' : 'text-slate-500'}`} />
+                Subjects & Materials
+              </button>
+
+              <button
+                onClick={() => { setActiveTab('tests'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'tests' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <FileText className={`h-5 w-5 ${activeTab === 'tests' ? 'text-white' : 'text-slate-500'}`} />
+                Tests & Invites
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => { setActiveTab('dashboard'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'dashboard' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <Compass className={`h-5 w-5 ${activeTab === 'dashboard' ? 'text-white' : 'text-slate-500'}`} />
+                My Active Tests
+              </button>
+
+              <button
+                onClick={() => { setActiveTab('studyplan'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'studyplan' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <Calendar className={`h-5 w-5 ${activeTab === 'studyplan' ? 'text-white' : 'text-slate-500'}`} />
+                Study Plan
+              </button>
+
+              <button
+                onClick={() => { setActiveTab('progress'); setMobileMenuOpen(false); }}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
+                  activeTab === 'progress' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                <Award className={`h-5 w-5 ${activeTab === 'progress' ? 'text-white' : 'text-slate-500'}`} />
+                Progress Tracker
+              </button>
+            </>
+          )}
+
+          <div className="pt-6 border-t border-slate-100">
+            <p className="px-3.5 text-xs font-semibold text-slate-400 uppercase tracking-wider">Subjects</p>
+            <div className="mt-2 space-y-1">
+              {subjects.map(sub => (
+                <button
+                  key={sub.id}
+                  onClick={() => { setCurrentSubject(sub); setActiveTab('study'); setMobileMenuOpen(false); }}
+                  className={`w-full flex items-center justify-between px-3.5 py-2 rounded-lg text-xs font-medium transition-all ${
+                    currentSubject?.id === sub.id ? 'bg-slate-100 text-slate-900 font-semibold' : 'text-slate-500 hover:bg-slate-50'
+                  }`}
+                >
+                  <span className="truncate">{sub.name}</span>
+                  <ChevronRight className="h-3 w-3 shrink-0" />
+                </button>
+              ))}
+            </div>
+          </div>
+        </nav>
+
+        {/* LOGGED IN USER PROFILE */}
+        <div className="p-4 border-t border-slate-100 bg-slate-50/50">
+          <div 
+            onClick={() => { setActiveTab('profile'); setMobileMenuOpen(false); }}
+            className="flex items-center gap-3 mb-3 hover:bg-slate-100/70 p-1.5 -mx-1.5 rounded-xl transition-colors cursor-pointer"
+            title="Profile Settings"
+          >
+            {userProfile?.avatar_url ? (
+              <img 
+                src={userProfile.avatar_url} 
+                className="h-8 w-8 object-cover rounded-full border border-violet-200 shrink-0" 
+                alt="Profile" 
+              />
+            ) : (
+              <div className="p-2 bg-slate-200 text-slate-600 rounded-full shrink-0">
+                <User className="h-4 w-4" />
+              </div>
+            )}
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5">
+                <p className="text-xs font-medium text-slate-500">Logged in as</p>
+                <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
+                  userRole === 'teacher' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-700'
+                }`}>
+                  {userRole === 'teacher' ? 'Teacher' : 'Student'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-700 truncate font-semibold mt-0.5">{session.user.email}</p>
+              {userProfile?.institution && (
+                <p className="text-[10px] text-slate-500 truncate font-medium mt-0.5">{userProfile.institution}</p>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center justify-center gap-2 py-2 px-3 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 rounded-xl text-xs font-semibold shadow-sm transition-colors cursor-pointer"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Logout
+          </button>
+        </div>
+      </aside>
+
+      {/* MAIN CONTENT WORKSPACE */}
+      <main className="flex-1 p-4 md:p-8 overflow-y-auto max-w-6xl mx-auto w-full">
+        
+        {/* IF CURRENTLY TAKING A PRACTICE SESSION (FULLSCREEN MODAL OVERLAY INSTEAD OF TABS) */}
+        {isPracticing && quizQuestions.length > 0 && (
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xl p-6 md:p-8 mb-8 animate-fadeIn">
+            {/* Header */}
+            <div className="flex justify-between items-center pb-4 border-b border-slate-100 mb-6">
+              <div>
+                <span className="text-xs font-bold uppercase tracking-wider text-violet-600 bg-violet-50 px-2.5 py-1 rounded-lg">
+                  {activeTest ? 'Test Assessment' : 'Practice Session'}
+                </span>
+                <h2 className="text-xl font-bold text-slate-900 mt-1">{activeTest ? activeTest.title : currentConcept?.name}</h2>
+              </div>
+              <button 
+                onClick={() => { if (confirm(activeTest ? 'Abort test? Progress will not be saved.' : 'Abort practice? Current score will not be saved.')) setIsPracticing(false); }}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                Quit Session
+              </button>
+            </div>
+
+            {/* Progress indicator */}
+            <div className="mb-6">
+              <div className="flex justify-between text-xs text-slate-500 mb-1">
+                <span>Question {activeQuestionIdx + 1} of {quizQuestions.length}</span>
+                <span>Difficulty {quizQuestions[activeQuestionIdx].difficulty} / 5</span>
+              </div>
+              <div className="w-full bg-slate-100 rounded-full h-1.5">
+                <div 
+                  className="bg-violet-600 h-1.5 rounded-full transition-all duration-300"
+                  style={{ width: `${((activeQuestionIdx + 1) / quizQuestions.length) * 100}%` }}
+                ></div>
+              </div>
+            </div>
+
+            {/* Question Box */}
+            <div className="bg-slate-50 rounded-xl p-5 border border-slate-100 mb-6">
+              <p className="text-lg font-semibold text-slate-800">
+                {quizQuestions[activeQuestionIdx].prompt}
+              </p>
+            </div>
+
+            {/* Answer Input depending on question type */}
+            <div className="space-y-4">
+              {quizQuestions[activeQuestionIdx].question_type === 'mcq' && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {quizQuestions[activeQuestionIdx].options?.map((option, idx) => (
+                    <button
+                      key={idx}
+                      disabled={!!quizFeedback}
+                      onClick={() => setStudentAnswer(option)}
+                      className={`text-left p-4 rounded-xl text-sm font-semibold transition-all border shadow-sm cursor-pointer ${
+                        studentAnswer === option 
+                          ? 'border-violet-600 bg-violet-50 text-violet-800 ring-2 ring-violet-500/20' 
+                          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {quizQuestions[activeQuestionIdx].question_type === 'short_answer' && (
+                <div>
+                  <textarea
+                    rows={3}
+                    disabled={!!quizFeedback}
+                    placeholder="Type your explanation here..."
+                    value={studentAnswer}
+                    onChange={(e) => setStudentAnswer(e.target.value)}
+                    className="w-full p-4 border border-slate-300 rounded-xl shadow-sm focus:ring-2 focus:ring-violet-500 focus:border-violet-500 text-sm font-medium"
+                  />
+                </div>
+              )}
+
+              {quizQuestions[activeQuestionIdx].question_type === 'flashcard' && (
+                <div className="flex flex-col items-center">
+                  {!flashcardRevealed ? (
+                    <button
+                      onClick={() => setFlashcardRevealed(true)}
+                      className="w-full max-w-md py-12 px-6 bg-white hover:bg-slate-50 border border-slate-200 rounded-2xl shadow-md text-center cursor-pointer font-bold text-violet-700 text-xl flex items-center justify-center gap-2"
+                    >
+                      <RotateCcw className="h-5 w-5 animate-spin-slow" />
+                      Click to Reveal Back
+                    </button>
+                  ) : (
+                    <div className="w-full max-w-md bg-violet-50 border border-violet-200 rounded-2xl p-6 shadow-md text-center animate-fadeIn">
+                      <p className="text-xs font-semibold uppercase text-violet-600 mb-2">Back of Card / Explanation</p>
+                      <p className="text-slate-800 font-semibold mb-6">{quizQuestions[activeQuestionIdx].correct_answer}</p>
+                      
+                      {!quizFeedback && (
+                        <div className="flex gap-4 justify-center">
+                          <button
+                            onClick={() => handleFlashcardGrade(false)}
+                            className="px-4 py-2 bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 rounded-xl text-sm font-bold flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                          >
+                            <XCircle className="h-4 w-4" /> I missed it
+                          </button>
+                          <button
+                            onClick={() => handleFlashcardGrade(true)}
+                            className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-sm font-bold flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                          >
+                            <CheckCircle2 className="h-4 w-4" /> I recalled correctly
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Submit Buttons */}
+              {!quizFeedback && quizQuestions[activeQuestionIdx].question_type !== 'flashcard' && (
+                <div className="flex justify-end pt-2">
+                  <button
+                    onClick={handleAnswerSubmit}
+                    disabled={isSubmittingAnswer || !studentAnswer.trim()}
+                    className="px-6 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-sm font-bold rounded-xl shadow-md transition-colors disabled:opacity-50 flex items-center gap-2 cursor-pointer"
+                  >
+                    {isSubmittingAnswer ? 'Evaluating Answer...' : 'Submit Answer'}
+                    <ChevronRight className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Feedback Block */}
+              {quizFeedback && (
+                <div className="mt-6 border border-slate-200 rounded-xl p-5 shadow-sm animate-slideUp">
+                  <div className="flex items-start gap-3">
+                    {quizFeedback.is_correct ? (
+                      <CheckCircle2 className="h-6 w-6 text-emerald-600 shrink-0 mt-0.5" />
+                    ) : (
+                      <XCircle className="h-6 w-6 text-rose-600 shrink-0 mt-0.5" />
+                    )}
+                    <div className="flex-1">
+                      <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                        {quizFeedback.is_correct ? 'Correct! Well Done.' : 'Incorrect attempt'}
+                        {masteryChange !== null && (
+                          <span className={`text-xs px-2 py-0.5 rounded font-bold ${masteryChange >= 0 ? 'text-emerald-700 bg-emerald-50' : 'text-rose-700 bg-rose-50'}`}>
+                            {masteryChange >= 0 ? `+${masteryChange}` : `${masteryChange}`} Mastery
+                          </span>
+                        )}
+                      </h4>
+                      
+                      {/* Socratic Feedback */}
+                      <p className="mt-2 text-sm text-slate-600 leading-relaxed font-medium">
+                        {quizFeedback.feedback}
+                      </p>
+
+                      {/* Display correct answer helper ONLY for Short Answer when incorrect, to help them compare, but keep it educative */}
+                      {!quizFeedback.is_correct && quizQuestions[activeQuestionIdx].question_type === 'short_answer' && (
+                        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs">
+                          <span className="font-semibold text-slate-500 block mb-1">Concept Benchmark Answer:</span>
+                          <span className="text-slate-700 font-medium">{quizQuestions[activeQuestionIdx].correct_answer}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex justify-end pt-4 border-t border-slate-100 mt-4">
+                    <button
+                      onClick={handleNextQuizQuestion}
+                      className="px-6 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-colors cursor-pointer"
+                    >
+                      {activeQuestionIdx + 1 < quizQuestions.length ? 'Next Question' : 'Complete Session'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB: DASHBOARD */}
+        {activeTab === 'dashboard' && (
+          <div className="space-y-8 animate-fadeIn">
+            {userRole === 'teacher' ? (
+              <>
+                {/* Teacher Top Overview Cards */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200/85 shadow-sm">
+                  <div>
+                    <h1 className="text-2xl font-black text-slate-900 tracking-tight">Mystudy Teacher Dashboard</h1>
+                    <p className="text-sm text-slate-500 mt-1">Select a subject, upload learning material, and track your student test results.</p>
+                  </div>
+                  <button
+                    onClick={() => setIsAddSubjectModalOpen(true)}
+                    className="inline-flex items-center gap-2 px-4.5 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-sm transition-colors cursor-pointer shrink-0"
+                  >
+                    <Plus className="h-4 w-4" /> Add New Subject
+                  </button>
+                </div>
+
+                {/* Subject Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {subjects.map(sub => {
+                    const metrics = getSubjectMasteryMetrics(sub.id)
+                    return (
+                      <div key={sub.id} className="bg-white rounded-2xl border border-slate-100 p-6 flex flex-col justify-between shadow-sm hover:shadow-md hover:scale-[1.02] hover:border-violet-100 transition-all duration-300">
+                        <div>
+                          <div className="flex justify-between items-start mb-4">
+                            <div className="max-w-[70%]">
+                              <h3 className="text-lg font-bold text-slate-800 truncate">{sub.name}</h3>
+                              <p className="text-xs text-slate-400 mt-0.5">Created {new Date(sub.created_at).toLocaleDateString()}</p>
+                            </div>
+
+                            {/* Circular Progress Ring */}
+                            <div className="relative flex items-center justify-center shrink-0">
+                              <svg className="w-14 h-14">
+                                <circle className="text-slate-100" strokeWidth="4" stroke="currentColor" fill="transparent" r="22" cx="28" cy="28"/>
+                                <circle className="text-violet-600 transition-all duration-300" strokeWidth="4" strokeDasharray={138} strokeDashoffset={138 - (138 * metrics.avg) / 100} strokeLinecap="round" stroke="currentColor" fill="transparent" r="22" cx="28" cy="28" transform="rotate(-90 28 28)"/>
+                              </svg>
+                              <span className="absolute text-xs font-bold text-slate-800">{metrics.avg}%</span>
+                            </div>
+                          </div>
+
+                          {/* Weakest Concept */}
+                          {metrics.weakest ? (
+                            <div className="mb-6 p-3.5 bg-rose-50/70 border border-rose-100 rounded-xl backdrop-blur-sm">
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-rose-500 block">Weakest Concept Flagged</span>
+                              <span className="text-sm font-bold text-slate-800 mt-1 block truncate">{metrics.weakest}</span>
+                              <span className="text-xs text-slate-500 mt-0.5 block">Mastery score is currently at {metrics.weakestScore}%</span>
+                            </div>
+                          ) : (
+                            <div className="mb-6 p-3.5 bg-slate-50/80 border border-slate-100 rounded-xl text-center">
+                              <span className="text-xs text-slate-500 font-medium">No concepts extracted yet. Upload study material to begin.</span>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex gap-3 mt-4 pt-4 border-t border-slate-100">
+                          <button
+                            onClick={() => {
+                              setCurrentSubject(sub)
+                              setActiveTab('study')
+                            }}
+                            className="flex-1 py-2 px-3 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 hover:scale-[1.02] active:scale-[0.98] text-white rounded-xl text-xs font-bold shadow-sm shadow-indigo-500/10 text-center cursor-pointer transition-all duration-200"
+                          >
+                            Study Materials
+                          </button>
+                          <button
+                            onClick={() => {
+                              setCurrentSubject(sub)
+                              setActiveTab('progress')
+                            }}
+                            className="flex-1 py-2 px-3 bg-white hover:bg-slate-50 border border-slate-200 hover:scale-[1.02] active:scale-[0.98] text-slate-700 rounded-xl text-xs font-bold text-center cursor-pointer transition-all duration-200"
+                          >
+                            View Progress
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+
+                  {subjects.length === 0 && (
+                    <div className="col-span-full bg-white border border-slate-200 rounded-2xl p-12 text-center shadow-sm">
+                      <BookOpen className="h-12 w-12 text-slate-300 mx-auto mb-4" />
+                      <h3 className="text-lg font-bold text-slate-800">Create your first subject</h3>
+                      <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">To start, create a study subject (like "Ethics 101" or "Sales Manual").</p>
+                      
+                      <form onSubmit={handleCreateSubject} className="mt-6 max-w-md mx-auto flex gap-2">
+                        <input
+                          type="text"
+                          required
+                          placeholder="e.g. Computer Science Basics"
+                          value={newSubjectName}
+                          onChange={(e) => setNewSubjectName(e.target.value)}
+                          className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isCreatingSubject}
+                          className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-lg shadow-md disabled:opacity-50 cursor-pointer"
+                        >
+                          {isCreatingSubject ? 'Creating...' : 'Create'}
+                        </button>
+                      </form>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Student Top Dashboard Overview */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-slate-200/85 shadow-sm">
+                  <div>
+                    <h1 className="text-2xl font-black text-slate-900 tracking-tight">Mystudy Assessment Center</h1>
+                    <p className="text-sm text-slate-500 mt-1">Join tests, practice study materials, and build your conceptual mastery scores.</p>
+                  </div>
+                </div>
+
+                {/* Join Test form */}
+                <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                  <h2 className="text-xl font-bold text-slate-800 mb-2">Join a Training Session / Test</h2>
+                  <p className="text-xs text-slate-500 mb-4">
+                    Enter the 6-character invitation code provided by your instructor or manager.
+                  </p>
+                  <form 
+                    onSubmit={async (e) => {
+                      e.preventDefault()
+                      if (!joinTestCode.trim()) return
+                      setIsJoiningTest(true)
+                      try {
+                        const test = await dbJoinTestByCode(session.user.id, joinTestCode.trim().toUpperCase())
+                        alert(`Successfully enrolled in "${test.title}"!`)
+                        setJoinTestCode('')
+                        loadUserData()
+                      } catch (err: any) {
+                        alert('Could not join test: ' + err.message)
+                      } finally {
+                        setIsJoiningTest(false)
+                      }
+                    }}
+                    className="flex flex-col sm:flex-row gap-3"
+                  >
+                    <input
+                      type="text"
+                      required
+                      placeholder="Enter Code (e.g. ETHICS)"
+                      value={joinTestCode}
+                      onChange={(e) => setJoinTestCode(e.target.value.toUpperCase())}
+                      className="flex-1 px-4 py-2.5 border border-slate-300 rounded-xl text-sm font-bold tracking-widest placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-violet-500 bg-white"
+                    />
+                    <button
+                      type="submit"
+                      disabled={isJoiningTest}
+                      className="px-6 py-2.5 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-sm font-bold shadow-md shadow-indigo-500/10 cursor-pointer disabled:opacity-50 transition-colors shrink-0"
+                    >
+                      {isJoiningTest ? 'Joining...' : 'Join Assessment'}
+                    </button>
+                  </form>
+                </div>
+
+                {/* Active & Completed Tests */}
+                <div className="space-y-4">
+                  <h3 className="text-base font-bold text-slate-800">Your Assessments & Tests</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {enrolledTests.map(enroll => {
+                      const matchedTest = tests.find(t => t.id === enroll.test_id)
+                      if (!matchedTest) return null
+                      return (
+                        <div key={enroll.id} className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col justify-between shadow-sm">
+                          <div>
+                            <div className="flex justify-between items-start mb-4">
+                              <div className="max-w-[70%]">
+                                <h4 className="text-base font-bold text-slate-800 truncate">{matchedTest.title}</h4>
+                                <p className="text-xs text-slate-400 mt-0.5">Subject: {matchedTest.subject_name}</p>
+                              </div>
+                              <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
+                                enroll.completed ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                              }`}>
+                                {enroll.completed ? 'Completed' : 'Active'}
+                              </span>
+                            </div>
+
+                            {enroll.completed ? (
+                              <div className="mb-4 bg-emerald-50 border border-emerald-100 rounded-xl p-4 flex items-center justify-between">
+                                <div>
+                                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-600 block leading-tight">Your Score</span>
+                                  <span className="text-2xl font-black text-emerald-800 mt-0.5 block">{enroll.score}%</span>
+                                </div>
+                                <span className="text-xs text-emerald-700 font-semibold">Submitted</span>
+                              </div>
+                            ) : (
+                              <div className="mb-4 bg-slate-50 border border-slate-100 rounded-xl p-4 flex items-center justify-between">
+                                <div>
+                                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block leading-tight">Questions</span>
+                                  <span className="text-lg font-extrabold text-slate-800 mt-0.5 block">{matchedTest.question_count} Questions</span>
+                                </div>
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      const subjectConcepts = await dbFetchConcepts(matchedTest.subject_id)
+                                      const allQuestions: Question[] = []
+                                      for (const concept of subjectConcepts) {
+                                        const conceptQuestions = await dbFetchQuestions(concept.id)
+                                        allQuestions.push(...conceptQuestions)
+                                      }
+
+                                      if (allQuestions.length === 0) {
+                                        alert('This test subject does not have any questions generated yet.')
+                                        return
+                                      }
+
+                                      const shuffled = [...allQuestions].sort(() => 0.5 - Math.random()).slice(0, matchedTest.question_count)
+                                      setQuizQuestions(shuffled)
+                                      setActiveQuestionIdx(0)
+                                      setStudentAnswer('')
+                                      setQuizFeedback(null)
+                                      setTestCorrectCount(0)
+                                      
+                                      setActiveTest(matchedTest)
+                                      setIsPracticing(true)
+                                    } catch (err: any) {
+                                      alert('Error starting test: ' + err.message)
+                                    }
+                                  }}
+                                  className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-xs font-bold shadow-md cursor-pointer transition-colors"
+                                >
+                                  Start Test
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+
+                    {enrolledTests.length === 0 && (
+                      <div className="col-span-full bg-white border border-slate-200 rounded-2xl p-12 text-center shadow-sm">
+                        <Compass className="h-12 w-12 text-slate-300 mx-auto mb-4" />
+                        <h3 className="text-lg font-bold text-slate-800">No assessments enrolled yet</h3>
+                        <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">
+                          Enter an invitation code above to join a test created by your instructor or manager.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {/* Self-study subjects */}
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <h3 className="text-base font-bold text-slate-800">Your Study Subjects</h3>
+                    <button
+                      onClick={() => setIsAddSubjectModalOpen(true)}
+                      className="inline-flex items-center gap-1 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl transition-all shadow-sm cursor-pointer"
+                    >
+                      <Plus className="h-3 w-3" /> Add Subject
+                    </button>
+                  </div>
+
+                  {subjects.length > 0 ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      {subjects.map(sub => {
+                        const metrics = getSubjectMasteryMetrics(sub.id)
+                        return (
+                          <div key={sub.id} className="bg-white rounded-2xl border border-slate-100 p-6 flex flex-col justify-between shadow-sm hover:shadow-md hover:scale-[1.02] hover:border-violet-100 transition-all duration-300">
+                            <div>
+                              <div className="flex justify-between items-start mb-4">
+                                <div className="max-w-[70%]">
+                                  <h3 className="text-lg font-bold text-slate-800 truncate">{sub.name}</h3>
+                                  <p className="text-xs text-slate-400 mt-0.5">Created {new Date(sub.created_at).toLocaleDateString()}</p>
+                                </div>
+        
+                                <div className="relative flex items-center justify-center shrink-0">
+                                  <svg className="w-14 h-14">
+                                    <circle className="text-slate-100" strokeWidth="4" stroke="currentColor" fill="transparent" r="22" cx="28" cy="28"/>
+                                    <circle className="text-violet-600 transition-all duration-300" strokeWidth="4" strokeDasharray={138} strokeDashoffset={138 - (138 * metrics.avg) / 100} strokeLinecap="round" stroke="currentColor" fill="transparent" r="22" cx="28" cy="28" transform="rotate(-90 28 28)"/>
+                                  </svg>
+                                  <span className="absolute text-xs font-bold text-slate-800">{metrics.avg}%</span>
+                                </div>
+                              </div>
+                            </div>
+        
+                            <div className="flex gap-3 mt-4 pt-4 border-t border-slate-100">
+                              <button
+                                onClick={() => {
+                                  setCurrentSubject(sub)
+                                  setActiveTab('study')
+                                }}
+                                className="flex-1 py-2 px-3 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold text-center cursor-pointer transition-all"
+                              >
+                                Study Materials
+                              </button>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <div className="bg-white border border-slate-200 border-dashed rounded-2xl p-8 text-center text-slate-500 text-sm">
+                      <BookOpen className="h-8 w-8 text-slate-300 mx-auto mb-2" />
+                      <p>You haven't created any study subjects yet.</p>
+                      <p className="text-xs text-slate-400 mt-1">Click the "Add Subject" button above to start self-learning.</p>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB: STUDY MATERIAL */}
+        {activeTab === 'study' && (
+          <div className="space-y-8 animate-fadeIn">
+            {/* Subject Selector Header */}
+            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <span className="text-xs font-bold text-violet-600 uppercase tracking-widest block">Study View</span>
+                <div className="flex items-center gap-2 mt-1">
+                  <h1 className="text-xl md:text-2xl font-black text-slate-900">{currentSubject?.name || 'No Subject Selected'}</h1>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <select
+                  value={currentSubject?.id || ''}
+                  onChange={(e) => {
+                    const match = subjects.find(s => s.id === e.target.value)
+                    if (match) setCurrentSubject(match)
+                  }}
+                  className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold shadow-sm focus:ring-violet-500 focus:border-violet-500 text-slate-700"
+                >
+                  {subjects.map(s => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => setIsAddingMaterial(!isAddingMaterial)}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 bg-violet-50 hover:bg-violet-100 text-violet-700 border border-violet-100 text-xs font-bold rounded-xl cursor-pointer transition-colors shadow-sm"
+                >
+                  <Plus className="h-4 w-4" /> Add Material
+                </button>
+              </div>
+            </div>
+
+            {/* GUIDED-HELP GUARDRAIL BLOCKED VIEW */}
+            {guardrailWarning && (
+              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-6 shadow-md animate-slideUp">
+                <div className="flex items-start gap-4">
+                  <AlertTriangle className="h-8 w-8 text-rose-600 shrink-0" />
+                  <div className="flex-1">
+                    <h3 className="text-lg font-black text-rose-900">Learning Guardrail Triggered</h3>
+                    <p className="text-sm text-rose-700 mt-1">
+                      Our system detected that the content you submitted resembles a homework assignment, essay prompt, or direct exam task designed for a completed answer. 
+                      To support your education, <strong>Mystudy will never do the work for you.</strong>
+                    </p>
+                    
+                    {/* Guiding Socratic help */}
+                    <div className="mt-4 bg-white border border-rose-200 rounded-xl p-5 shadow-sm">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-2">Socratic Guidance</span>
+                      <p className="text-slate-700 text-sm font-semibold italic">"{guardrailWarning.guidance}"</p>
+                    </div>
+
+                    <div className="mt-4 flex gap-3">
+                      <button 
+                        onClick={() => {
+                          setRawText(guardrailWarning.originalInput)
+                          setGuardrailWarning(null)
+                          setIsAddingMaterial(true)
+                        }}
+                        className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer"
+                      >
+                        Revise Input
+                      </button>
+                      <button 
+                        onClick={() => setGuardrailWarning(null)}
+                        className="px-4 py-2 bg-white hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ADD MATERIAL PANEL */}
+            {isAddingMaterial && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-md animate-slideUp">
+                <h3 className="text-base font-bold text-slate-800 mb-4">Add Study Material / Concept Source</h3>
+                
+                {materialLoadingState ? (
+                  <div className="py-8 text-center space-y-4">
+                    <div className="w-10 h-10 border-4 border-violet-600 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                    <p className="text-sm font-bold text-slate-700 animate-pulse">{materialLoadingState}</p>
+                  </div>
+                ) : (
+                  <form onSubmit={handleAddMaterial} className="space-y-4">
+                    {/* Source type tabs */}
+                    <div>
+                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Input Source Type</label>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setSourceType('paste')}
+                          className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                            sourceType === 'paste' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                          }`}
+                        >
+                          Paste Notes/Text
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSourceType('upload')}
+                          className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                            sourceType === 'upload' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                          }`}
+                        >
+                          Upload File (PDF, DOC/X, PPTX, TXT, MD)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSourceType('topic_only')}
+                          className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                            sourceType === 'topic_only' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                          }`}
+                        >
+                          Topic Only (No materials)
+                        </button>
+                      </div>
+                    </div>
+
+                    {sourceType === 'paste' && (
+                      <div className="space-y-3">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Material Title</label>
+                          <input
+                            type="text"
+                            required
+                            placeholder="e.g. Chapter 4: Photosynthesis Notes"
+                            value={materialTitle}
+                            onChange={(e) => setMaterialTitle(e.target.value)}
+                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Paste Learning Text Content</label>
+                          <textarea
+                            rows={6}
+                            required
+                            placeholder="Paste chapters, lecture notes, definitions, or general text..."
+                            value={rawText}
+                            onChange={(e) => setRawText(e.target.value)}
+                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {sourceType === 'upload' && (
+                      <div className="space-y-3 border-2 border-dashed border-slate-200 rounded-xl p-6 text-center">
+                        <FileText className="h-10 w-10 text-slate-400 mx-auto mb-2" />
+                        <span className="text-xs text-slate-500 block mb-2">Upload study document (PDF, DOC, DOCX, PPTX, TXT, MD)</span>
+                        <input
+                          type="file"
+                          accept=".txt,.md,.json,.pdf,.docx,.pptx,.doc"
+                          onChange={handleFileUpload}
+                          className="mx-auto block text-xs text-slate-500"
+                        />
+                        {rawText && (
+                          <div className="mt-4 bg-slate-50 p-3 rounded-lg border border-slate-100 text-left max-h-40 overflow-y-auto">
+                            <span className="text-[10px] font-bold text-slate-400 block mb-1">File Preview: {materialTitle}</span>
+                            <span className="text-xs font-medium text-slate-700 block whitespace-pre-wrap">{rawText.slice(0, 500)}...</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {sourceType === 'topic_only' && (
+                      <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Topic Name</label>
+                        <input
+                          type="text"
+                          required
+                          placeholder="e.g. Mitosis, Capitalism vs Socialism, Linear Algebra"
+                          value={topicOnlyName}
+                          onChange={(e) => setTopicOnlyName(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500"
+                        />
+                      </div>
+                    )}
+
+                    <div className="flex justify-end gap-2 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setIsAddingMaterial(false)}
+                        className="px-4 py-2 border border-slate-200 hover:bg-slate-50 rounded-xl text-xs font-bold cursor-pointer transition-colors shadow-sm"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-xs font-bold shadow-md cursor-pointer transition-colors"
+                      >
+                        Submit & Extract Concepts
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+
+            {/* CONCEPTS STUDY CORE VIEW */}
+            {currentSubject && concepts.length > 0 && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                
+                {/* Concepts list panel */}
+                <div className="lg:col-span-4 space-y-3">
+                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Concepts Extracted</h3>
+                  <div className="space-y-2">
+                    {concepts.map(con => {
+                      const m = masteries.find(ma => ma.concept_id === con.id)
+                      const decayedScore = m ? getDecayedMastery(m.score, m.last_updated) : 50
+                      return (
+                        <button
+                          key={con.id}
+                          onClick={() => {
+                            setCurrentConcept(con)
+                            setExplainSimpler(false)
+                          }}
+                          className={`w-full text-left p-4 rounded-xl border shadow-sm transition-all flex flex-col justify-between cursor-pointer ${
+                            currentConcept?.id === con.id
+                              ? 'border-violet-600 bg-violet-50/40 ring-1 ring-violet-500/25'
+                              : 'border-slate-200 bg-white hover:bg-slate-50'
+                          }`}
+                        >
+                          <span className="font-bold text-slate-800 truncate block">{con.name}</span>
+                          
+                          <div className="flex items-center gap-2 mt-2 w-full">
+                            <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                              <div 
+                                className={`h-1.5 rounded-full ${
+                                  decayedScore >= 70 ? 'bg-emerald-500' : decayedScore >= 40 ? 'bg-amber-500' : 'bg-rose-500'
+                                }`}
+                                style={{ width: `${decayedScore}%` }}
+                              ></div>
+                            </div>
+                            <span className="text-[10px] font-bold text-slate-500 shrink-0">{decayedScore}%</span>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* Concept Study details card */}
+                {currentConcept && (
+                  <div className="lg:col-span-8 space-y-6">
+                    <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col justify-between min-h-[300px]">
+                      <div>
+                        {/* Tab header */}
+                        <div className="flex justify-between items-center pb-4 border-b border-slate-100 mb-6">
+                          <h3 className="text-xl font-bold text-slate-900">{currentConcept.name}</h3>
+                          
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-slate-500">Explain Simpler:</span>
+                            <button
+                              onClick={() => setExplainSimpler(!explainSimpler)}
+                              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                explainSimpler ? 'bg-violet-600' : 'bg-slate-200'
+                              }`}
+                            >
+                              <span
+                                className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                  explainSimpler ? 'translate-x-5' : 'translate-x-0'
+                                }`}
+                              />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Explanation Content */}
+                        <div className="space-y-6 font-medium text-slate-700 leading-relaxed text-sm">
+                          {!explainSimpler ? (
+                            <div className="space-y-4">
+                              <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Concept Summary</p>
+                              <p>{currentConcept.summary}</p>
+                            </div>
+                          ) : (
+                            <div className="space-y-4 animate-fadeIn">
+                              <div className="p-3 bg-violet-50/70 rounded-xl border border-violet-100 flex items-start gap-2 text-violet-800 text-xs">
+                                <Lightbulb className="h-4 w-4 shrink-0 mt-0.5" />
+                                <span>Using simpler explanation mode with analogy to aid understanding.</span>
+                              </div>
+                              
+                              <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Analogy & Simplified Version</p>
+                              <p>{currentConcept.simple_explanation}</p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Launch practice session */}
+                      <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end">
+                        <button
+                          onClick={() => startPractice(currentConcept)}
+                          className="px-6 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Brain className="h-4 w-4" /> Practice this Concept
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {currentSubject && concepts.length === 0 && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center shadow-sm">
+                <BookOpen className="h-12 w-12 text-slate-300 mx-auto mb-4" />
+                <h3 className="text-lg font-bold text-slate-800">No study materials in "{currentSubject.name}"</h3>
+                <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">Upload learning notes or pick a learning topic above to extract concepts and start active recall practice.</p>
+                <button
+                  onClick={() => setIsAddingMaterial(true)}
+                  className="mt-6 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md transition-colors cursor-pointer"
+                >
+                  Add Learning Material Now
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB: PROGRESS DASHBOARD */}
+        {activeTab === 'progress' && (
+          <div className="space-y-8 animate-fadeIn">
+            <h1 className="text-2xl font-black text-slate-900 tracking-tight">Active Mastery Progress</h1>
+
+            {/* Grid for mastery scores */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+              
+              {/* Weakest concepts warnings */}
+              <div className="lg:col-span-1 space-y-6">
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+                  <h3 className="text-base font-bold text-slate-800 mb-4 flex items-center gap-2">
+                    <AlertTriangle className="h-5 w-5 text-rose-500" /> Key Weak Areas
+                  </h3>
+                  
+                  <div className="space-y-3">
+                    {masteries
+                      .map(m => ({ ...m, decayedScore: getDecayedMastery(m.score, m.last_updated) }))
+                      .filter(m => m.decayedScore < 40)
+                      .map(m => (
+                        <div key={m.id} className="p-3 bg-rose-50 border border-rose-100 rounded-xl flex items-center justify-between">
+                          <div className="truncate max-w-[70%]">
+                            <span className="text-sm font-bold text-slate-800 truncate block">{m.concept_name}</span>
+                            <span className="text-[10px] text-slate-400 block">Current score: {m.decayedScore}%</span>
+                          </div>
+                          <span className="text-xs font-black text-rose-600 bg-white px-2.5 py-1 rounded-lg border border-rose-200 shrink-0">
+                            Critical
+                          </span>
+                        </div>
+                      ))}
+
+                    {masteries.filter(m => getDecayedMastery(m.score, m.last_updated) < 40).length === 0 && (
+                      <div className="text-center py-6 text-slate-500 text-xs font-medium">
+                        Excellent! No concepts are flagged under 40% mastery. Keep reviewing to avoid decay.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+                  <h3 className="text-base font-bold text-slate-800 mb-4 flex items-center gap-2">
+                    <TrendingUp className="h-5 w-5 text-emerald-500" /> Mastery Ranges
+                  </h3>
+                  <div className="space-y-3.5 text-xs font-semibold">
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-500 flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full"></span> Mastered (70-100)
+                      </span>
+                      <span className="text-slate-800">{masteries.filter(m => getDecayedMastery(m.score, m.last_updated) >= 70).length} concepts</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-500 flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 bg-amber-500 rounded-full"></span> Developing (40-69)
+                      </span>
+                      <span className="text-slate-800">{masteries.filter(m => {
+                        const ds = getDecayedMastery(m.score, m.last_updated)
+                        return ds >= 40 && ds < 70
+                      }).length} concepts</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-500 flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 bg-rose-500 rounded-full"></span> Unmastered (0-39)
+                      </span>
+                      <span className="text-slate-800">{masteries.filter(m => getDecayedMastery(m.score, m.last_updated) < 40).length} concepts</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Progress bars list */}
+              <div className="lg:col-span-2 space-y-6">
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+                  <h3 className="text-base font-bold text-slate-800 mb-6">Concept Mastery Tracker</h3>
+
+                  <div className="space-y-6">
+                    {masteries.map(m => {
+                      const ds = getDecayedMastery(m.score, m.last_updated)
+                      const isDecayed = ds < m.score
+                      return (
+                        <div key={m.id} className="space-y-1.5">
+                          <div className="flex justify-between text-xs font-bold text-slate-700">
+                            <span className="truncate">{m.concept_name}</span>
+                            <div className="flex items-center gap-2">
+                              {isDecayed && (
+                                <span className="text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded font-medium flex items-center gap-0.5">
+                                  <Clock className="h-2.5 w-2.5" /> Decayed (Forgetting)
+                                </span>
+                              )}
+                              <span>{ds} / 100</span>
+                            </div>
+                          </div>
+
+                          <div className="w-full bg-slate-100 rounded-full h-3.5 overflow-hidden border border-slate-100 flex">
+                            <div 
+                              className={`h-3.5 rounded-full transition-all duration-300 ${
+                                ds >= 70 ? 'bg-emerald-500' : ds >= 40 ? 'bg-amber-500' : 'bg-rose-500'
+                              }`}
+                              style={{ width: `${ds}%` }}
+                            ></div>
+                          </div>
+                        </div>
+                      )
+                    })}
+
+                    {masteries.length === 0 && (
+                      <div className="text-center py-12 text-slate-400 text-sm">
+                        No concepts tracked yet. Fill subjects with materials and attempt questions to see mastery ratings!
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Attempt History List */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+              <h3 className="text-base font-bold text-slate-800 mb-6">Recent Practice History</h3>
+              <div className="space-y-4">
+                {attempts.map(att => (
+                  <div key={att.id} className="p-4 border border-slate-100 rounded-xl hover:bg-slate-50/50 transition-colors flex flex-col md:flex-row md:items-start gap-4">
+                    <div className="shrink-0">
+                      {att.is_correct ? (
+                        <CheckCircle2 className="h-6 w-6 text-emerald-600" />
+                      ) : (
+                        <XCircle className="h-6 w-6 text-rose-600" />
+                      )}
+                    </div>
+                    <div className="flex-1 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-slate-400 uppercase">{att.concept_name}</span>
+                        <span className="text-xs text-slate-400">{new Date(att.answered_at).toLocaleDateString()} {new Date(att.answered_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                      <p className="text-sm font-bold text-slate-800">{att.question_prompt}</p>
+                      <div className="bg-white border border-slate-200/80 rounded-lg p-2.5 text-xs text-slate-700 font-medium">
+                        <span className="text-slate-400 text-[10px] font-bold uppercase tracking-wider block mb-1">Student Answer</span>
+                        {att.student_answer}
+                      </div>
+                      <div className="text-xs text-slate-500 pt-1">
+                        <strong className="text-slate-700">Socratic feedback:</strong> {att.ai_feedback}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                {attempts.length === 0 && (
+                  <div className="text-center py-8 text-slate-400 text-sm">
+                    No learning attempts logged yet. Try practicing to track your results!
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB: STUDY PLAN */}
+        {activeTab === 'studyplan' && (
+          <div className="space-y-8 animate-fadeIn">
+            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-6">
+              <div>
+                <h1 className="text-2xl font-black text-slate-900 tracking-tight">Adaptive Study Plan</h1>
+                <p className="text-sm text-slate-500 mt-1">Generate a structured list of tasks and minutes based on your actual weaknesses.</p>
+              </div>
+
+              {/* Set budget and generate */}
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-slate-500 uppercase">Daily Budget:</span>
+                  <input
+                    type="number"
+                    min={10}
+                    max={180}
+                    value={studyMinutesBudget}
+                    onChange={(e) => setStudyMinutesBudget(Number(e.target.value))}
+                    className="w-16 px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs font-bold text-center shadow-sm"
+                  />
+                  <span className="text-xs font-bold text-slate-500 uppercase">Minutes</span>
+                </div>
+
+                <button
+                  onClick={handleGenerateStudyPlan}
+                  disabled={isGeneratingPlan}
+                  className="px-4 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md transition-colors disabled:opacity-50 flex items-center gap-2 cursor-pointer"
+                >
+                  {isGeneratingPlan ? 'Generating Schedule...' : 'Regenerate Study Plan'}
+                  <Sparkles className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Plan Display */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+              <h3 className="text-base font-bold text-slate-800 mb-6 flex items-center gap-2">
+                <Calendar className="h-5 w-5 text-violet-600" /> Today's Recommended Schedule
+              </h3>
+
+              <div className="space-y-4">
+                {studyPlanItems.map(item => (
+                  <div 
+                    key={item.id} 
+                    className={`p-4 border rounded-xl flex items-start gap-4 transition-all ${
+                      item.completed 
+                        ? 'border-slate-200 bg-slate-50/50 opacity-60' 
+                        : 'border-slate-200 bg-white hover:border-violet-200'
+                    }`}
+                  >
+                    {/* Checkbox */}
+                    <button
+                      onClick={() => handleTogglePlanItem(item.id, !item.completed)}
+                      className={`h-5 w-5 rounded-md border flex items-center justify-center shrink-0 mt-0.5 cursor-pointer transition-colors ${
+                        item.completed 
+                          ? 'border-violet-600 bg-violet-600 text-white' 
+                          : 'border-slate-300 hover:border-violet-400 bg-white'
+                      }`}
+                    >
+                      {item.completed && <Check className="h-3.5 w-3.5 stroke-[3px]" />}
+                    </button>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                        <span className={`font-bold text-sm ${item.completed ? 'text-slate-500 line-through' : 'text-slate-800'}`}>
+                          {item.concept_name}
+                        </span>
+                        
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-bold text-slate-400 uppercase">Priority {item.priority}</span>
+                          <span className="text-xs bg-violet-50 text-violet-700 px-2 py-0.5 rounded font-bold flex items-center gap-1">
+                            <Clock className="h-3 w-3" /> {item.suggested_minutes} mins
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Motivation reason */}
+                      {item.ai_reason && (
+                        <p className="text-xs text-slate-500 mt-1 italic font-medium">
+                          💡 {item.ai_reason}
+                        </p>
+                      )}
+
+                      {!item.completed && (
+                        <div className="mt-3.5 flex justify-end">
+                          <button
+                            onClick={() => {
+                              // Find concept
+                              const found = concepts.find(c => c.id === item.concept_id)
+                              if (found) {
+                                setCurrentConcept(found)
+                                setActiveTab('study')
+                              } else {
+                                // Fallback search in masteries or fetch
+                                alert('Please navigate to the study tab and pick this concept from the list!')
+                              }
+                            }}
+                            className="px-3 py-1 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-[10px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            Go to Concept <ArrowRight className="h-2.5 w-2.5" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+
+                {studyPlanItems.length === 0 && (
+                  <div className="text-center py-12 text-slate-400 text-sm">
+                    No tasks scheduled. Select your daily budget above and click "Regenerate Study Plan" to map out your tasks!
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB: TESTS & INVITES (TEACHER ONLY) */}
+        {activeTab === 'tests' && userRole === 'teacher' && (
+          <div className="space-y-8 animate-fadeIn">
+            {/* Create Test Section */}
+            <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
+              <h2 className="text-xl font-bold text-slate-800 mb-2">Create a Test / Training Assessment</h2>
+              <p className="text-xs text-slate-500 mb-6">
+                Upload your document in the Subjects tab first, then set questions count and invite students or workers to join.
+              </p>
+
+              <form 
+                onSubmit={async (e) => {
+                  e.preventDefault()
+                  if (!newTestTitle.trim() || !newTestSubjectId) {
+                    alert('Please provide a title and select a subject.')
+                    return
+                  }
+                  setIsCreatingTest(true)
+                  try {
+                    const newTest = await dbCreateTest(
+                      session.user.id,
+                      newTestTitle.trim(),
+                      newTestSubjectId,
+                      newTestQuestionCount,
+                      newTestDisableGuidance
+                    )
+                    alert(`Test created! Invitation Code: ${newTest.code}`)
+                    setNewTestTitle('')
+                    setNewTestDisableGuidance(false)
+                    // Reload
+                    loadUserData()
+                  } catch (err: any) {
+                    alert('Failed to create test: ' + err.message)
+                  } finally {
+                    setIsCreatingTest(false)
+                  }
+                }}
+                className="grid grid-cols-1 md:grid-cols-2 gap-5"
+              >
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                      Test Title
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="e.g. Work Ethics Assessment"
+                      value={newTestTitle}
+                      onChange={(e) => setNewTestTitle(e.target.value)}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                      Select Subject / Material
+                    </label>
+                    <select
+                      value={newTestSubjectId}
+                      onChange={(e) => setNewTestSubjectId(e.target.value)}
+                      required
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium bg-white text-slate-700"
+                    >
+                      <option value="">-- Choose a Subject --</option>
+                      {subjects.map(s => (
+                        <option key={s.id} value={s.id}>{s.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                      Number of Questions per Student
+                    </label>
+                    <input
+                      type="number"
+                      required
+                      min={1}
+                      max={50}
+                      value={newTestQuestionCount}
+                      onChange={(e) => setNewTestQuestionCount(Number(e.target.value))}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2.5 pt-4">
+                    <button
+                      type="button"
+                      onClick={() => setNewTestDisableGuidance(!newTestDisableGuidance)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        newTestDisableGuidance ? 'bg-violet-600' : 'bg-slate-200'
+                      }`}
+                    >
+                      <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                        newTestDisableGuidance ? 'translate-x-5' : 'translate-x-0'
+                      }`} />
+                    </button>
+                    <div className="text-left">
+                      <span className="text-xs font-bold text-slate-700 block">Disable Socratic Guidance</span>
+                      <span className="text-[10px] text-slate-400 block leading-tight">Students won't receive analogies or Socratic hints during the test.</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="md:col-span-2 pt-2">
+                  <button
+                    type="submit"
+                    disabled={isCreatingTest}
+                    className="w-full py-2.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-500/10 cursor-pointer disabled:opacity-50 transition-all"
+                  >
+                    {isCreatingTest ? 'Creating Test...' : 'Create Test & Generate Code'}
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* Created Tests List */}
+            <div className="space-y-4">
+              <h3 className="text-base font-bold text-slate-800">Your Tests & Assessment Codes</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {tests.map(test => (
+                  <div key={test.id} className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col justify-between shadow-sm hover:shadow-md transition-shadow">
+                    <div>
+                      <div className="flex justify-between items-start mb-4">
+                        <div className="max-w-[65%]">
+                          <h4 className="text-base font-bold text-slate-800 truncate">{test.title}</h4>
+                          <p className="text-xs text-slate-400 mt-0.5">Subject: {test.subject_name}</p>
+                        </div>
+                        <div className="text-right">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-violet-600 bg-violet-50 px-2 py-0.5 rounded">
+                            {test.question_count} Questions
+                          </span>
+                          {test.disable_guidance && (
+                            <span className="text-[9px] font-bold uppercase tracking-wider text-rose-600 bg-rose-50 px-2 py-0.5 rounded block mt-1">
+                              Guidance Disabled
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Large Invitation Code Display */}
+                      <div className="mb-4 bg-slate-50 border border-slate-100 rounded-xl p-4 flex items-center justify-between">
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block leading-tight">Student Invitation Code</span>
+                          <span className="text-2xl font-black text-slate-900 tracking-wider mt-0.5 block">{test.code}</span>
+                        </div>
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(test.code)
+                            alert(`Invitation code "${test.code}" copied to clipboard!`)
+                          }}
+                          className="px-3 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-700 shadow-sm cursor-pointer transition-colors"
+                        >
+                          Copy Code
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-100 mt-2">
+                      <button
+                        onClick={async () => {
+                          try {
+                            const scores = await dbFetchTestScores(test.id)
+                            // Show student results dialog
+                            alert(`Loaded student scores for "${test.title}":\n\n` + 
+                              scores.map((s: TestStudent) => `- ${s.student_email}: ${s.completed ? `${s.score}%` : 'In Progress'}`).join('\n')
+                            )
+                          } catch (err) {
+                            alert('Failed to load scores')
+                          }
+                        }}
+                        className="w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-xs font-bold transition-colors cursor-pointer text-center"
+                      >
+                        View Student Results & Scores
+                      </button>
+                    </div>
+                  </div>
+                ))}
+
+                {tests.length === 0 && (
+                  <div className="col-span-full bg-white border border-slate-200 rounded-2xl p-12 text-center shadow-sm">
+                    <FileText className="h-12 w-12 text-slate-300 mx-auto mb-4" />
+                    <h3 className="text-lg font-bold text-slate-800">No tests created yet</h3>
+                    <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">
+                      Generate questions for your materials first, then fill out the form above to invite workers or students.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {/* TAB: PROFILE SETTINGS */}
+        {activeTab === 'profile' && (
+          <div className="space-y-8 animate-fadeIn max-w-2xl mx-auto">
+            <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Profile Settings</h2>
+                <p className="text-xs text-slate-500 mt-1">
+                  Customize your learning profile image and details.
+                </p>
+              </div>
+
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault()
+                  if (!session) return
+                  
+                  const targetInstitution = (e.currentTarget.elements.namedItem('institution') as HTMLInputElement).value
+                  const avatarInput = e.currentTarget.elements.namedItem('avatar_file') as HTMLInputElement
+                  let avatarBase64 = userProfile?.avatar_url || null
+                  
+                  const file = avatarInput.files?.[0]
+                  if (file) {
+                    const reader = new FileReader()
+                    const readPromise = new Promise<string>((resolve, reject) => {
+                      reader.onload = (event) => resolve(event.target?.result as string)
+                      reader.onerror = (err) => reject(err)
+                    })
+                    reader.readAsDataURL(file)
+                    try {
+                      avatarBase64 = await readPromise
+                    } catch (err) {
+                      alert('Failed to read image file.')
+                      return
+                    }
+                  }
+                  
+                  try {
+                    const updated = await dbUpdateUserProfile(
+                      session.user.id,
+                      targetInstitution.trim() || null,
+                      avatarBase64
+                    )
+                    setUserProfile(updated)
+                    alert('Profile updated successfully!')
+                  } catch (err: any) {
+                    alert('Failed to update profile: ' + err.message)
+                  }
+                }}
+                className="space-y-5"
+              >
+                {/* Avatar upload */}
+                <div className="flex flex-col sm:flex-row items-center gap-4 p-4 bg-slate-50 rounded-xl border border-slate-100">
+                  <div className="relative shrink-0">
+                    {userProfile?.avatar_url ? (
+                      <img 
+                        src={userProfile.avatar_url} 
+                        className="h-20 w-20 object-cover rounded-full border-2 border-violet-200" 
+                        alt="Avatar Preview" 
+                        id="avatar-preview-img"
+                      />
+                    ) : (
+                      <div className="h-20 w-20 bg-slate-200 text-slate-600 rounded-full flex items-center justify-center border-2 border-slate-300 shrink-0">
+                        <User className="h-10 w-10" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1 text-center sm:text-left space-y-1">
+                    <span className="text-xs font-bold text-slate-700 block">Profile Picture</span>
+                    <input 
+                      type="file" 
+                      name="avatar_file" 
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0]
+                        if (file) {
+                          const reader = new FileReader()
+                          reader.onload = (event) => {
+                            const img = document.getElementById('avatar-preview-img') as HTMLImageElement
+                            if (img) img.src = event.target?.result as string
+                          }
+                          reader.readAsDataURL(file)
+                        }
+                      }}
+                      className="text-xs text-slate-500 max-w-xs block mx-auto sm:mx-0"
+                    />
+                    <span className="text-[10px] text-slate-400 block">PNG, JPG, or GIF up to 2MB.</span>
+                    {userProfile?.avatar_url && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (confirm('Remove profile picture?')) {
+                            dbUpdateUserProfile(session.user.id, userProfile.institution || null, null).then(updated => {
+                              setUserProfile(updated)
+                            })
+                          }
+                        }}
+                        className="text-[10px] text-red-500 font-bold hover:underline cursor-pointer"
+                      >
+                        Remove Image
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Email (Read only) */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    disabled
+                    value={session.user.email}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-400 bg-slate-50"
+                  />
+                </div>
+
+                {/* Role (Read only) */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                    User Role
+                  </label>
+                  <input
+                    type="text"
+                    disabled
+                    value={userRole === 'teacher' ? 'Teacher / Instructor' : 'Student / Learner'}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-400 bg-slate-50"
+                  />
+                </div>
+
+                {/* Institution/Organization */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                    Institution / Organization
+                  </label>
+                  <input
+                    type="text"
+                    name="institution"
+                    defaultValue={userProfile?.institution || ''}
+                    placeholder="e.g. Harvard University, Acme Corp"
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium text-slate-700 bg-white"
+                  />
+                </div>
+
+                <div className="pt-2 flex gap-3">
+                  <button
+                    type="submit"
+                    className="flex-1 py-2.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-500/10 cursor-pointer transition-all"
+                  >
+                    Save Changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('dashboard')}
+                    className="px-4 py-2.5 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer"
+                  >
+                    Back to Dashboard
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ADD SUBJECT MODAL */}
+        {isAddSubjectModalOpen && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-6 space-y-4 animate-scaleUp">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h3 className="text-base font-bold text-slate-800">Add New Subject</h3>
+                  <p className="text-xs text-slate-500 mt-1">Enter the name of your new study subject.</p>
+                </div>
+                <button 
+                  onClick={() => setIsAddSubjectModalOpen(false)}
+                  className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleModalCreateSubject} className="space-y-4">
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Organic Chemistry, Marketing 101"
+                  value={modalSubjectName}
+                  onChange={(e) => setModalSubjectName(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium text-slate-700 bg-white"
+                />
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsAddSubjectModalOpen(false)}
+                    className="px-4 py-2 border border-slate-200 hover:bg-slate-50 rounded-xl text-xs font-bold cursor-pointer transition-colors shadow-sm"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isCreatingSubject}
+                    className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md disabled:opacity-50 cursor-pointer transition-colors"
+                  >
+                    {isCreatingSubject ? 'Creating...' : 'Create Subject'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+      </main>
+    </div>
+  )
+}
