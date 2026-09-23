@@ -32,11 +32,14 @@ export interface Question {
   id: string
   concept_id: string
   question_type: 'mcq' | 'short_answer' | 'flashcard'
+  sub_type?: 'objective' | 'theory' | 'body'
   prompt: string
   options: string[] | null
   correct_answer: string
   difficulty: number
   created_at: string
+  concept_name?: string
+  rubric?: string
 }
 
 export interface Attempt {
@@ -381,43 +384,135 @@ export async function dbFetchQuestions(conceptId: string): Promise<Question[]> {
     const supabase = getSupabaseClient()!
     const { data, error } = await supabase.from('questions').select('*').eq('concept_id', conceptId)
     if (error) throw error
-    return data || []
+    return (data || []).map(q => {
+      let subType: 'objective' | 'theory' | 'body' = q.question_type === 'mcq' ? 'objective' : 'theory'
+      let cleanOptions: string[] | null = null
+      let rubric: string | undefined = undefined
+
+      if (Array.isArray(q.options)) {
+        cleanOptions = q.options
+        subType = 'objective'
+      } else if (q.options && typeof q.options === 'object') {
+        if (q.options.subType) subType = q.options.subType
+        if (q.options.rubric) rubric = q.options.rubric
+        if (Array.isArray(q.options.choices)) cleanOptions = q.options.choices
+      }
+
+      return {
+        ...q,
+        sub_type: subType,
+        options: cleanOptions,
+        rubric: rubric
+      }
+    })
   } else {
     return mockDb.getQuestions().filter(q => q.concept_id === conceptId)
   }
 }
 
+export async function dbFetchQuestionsForSubject(subjectId: string): Promise<Question[]> {
+  const concepts = await dbFetchConcepts(subjectId)
+  const allQuestions: Question[] = []
+  for (const c of concepts) {
+    const qs = await dbFetchQuestions(c.id)
+    allQuestions.push(...qs.map(q => ({ ...q, concept_name: c.name })))
+  }
+  return allQuestions
+}
+
 export async function dbCreateQuestions(
-  questionsList: Array<{ type: 'mcq' | 'short_answer' | 'flashcard'; prompt: string; options: string[] | null; correct_answer: string; difficulty: number }>,
+  questionsList: Array<{
+    type: 'mcq' | 'short_answer' | 'flashcard'
+    sub_type?: 'objective' | 'theory' | 'body'
+    prompt: string
+    options: string[] | null
+    correct_answer: string
+    difficulty: number
+    concept_name?: string
+    rubric?: string
+  }>,
   conceptId: string
 ): Promise<Question[]> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const rows = questionsList.map(q => ({
-      concept_id: conceptId,
-      question_type: q.type,
-      prompt: q.prompt,
-      options: q.options,
-      correct_answer: q.correct_answer,
-      difficulty: q.difficulty
-    }))
+    const rows = questionsList.map(q => {
+      // Store sub_type and rubric in options if options is null for short_answer
+      let storedOptions: any = q.options
+      if (!storedOptions && (q.sub_type || q.rubric)) {
+        storedOptions = { subType: q.sub_type || 'theory', rubric: q.rubric || '' }
+      }
+
+      return {
+        concept_id: conceptId,
+        question_type: q.type,
+        prompt: q.prompt,
+        options: storedOptions,
+        correct_answer: q.correct_answer,
+        difficulty: q.difficulty
+      }
+    })
     const { data, error } = await supabase.from('questions').insert(rows).select()
     if (error) throw error
-    return data || []
+    return (data || []).map((row, idx) => ({
+      ...row,
+      sub_type: questionsList[idx]?.sub_type || (row.question_type === 'mcq' ? 'objective' : 'theory'),
+      rubric: questionsList[idx]?.rubric
+    }))
   } else {
     const created: Question[] = questionsList.map(q => ({
       id: 'q-' + Math.random().toString(36).substr(2, 9),
       concept_id: conceptId,
       question_type: q.type,
+      sub_type: q.sub_type || (q.type === 'mcq' ? 'objective' : 'theory'),
       prompt: q.prompt,
       options: q.options,
       correct_answer: q.correct_answer,
       difficulty: q.difficulty,
+      concept_name: q.concept_name,
+      rubric: q.rubric,
       created_at: new Date().toISOString()
     }))
     const current = mockDb.getQuestions()
     mockDb.setQuestions([...current, ...created])
     return created
+  }
+}
+
+export async function dbDeleteConcept(conceptId: string): Promise<void> {
+  if (isSupabaseConfigured()) {
+    const supabase = getSupabaseClient()!
+    // Delete cascade dependencies
+    await supabase.from('attempts').delete().filter('question_id', 'in', `(select id from questions where concept_id = '${conceptId}')`)
+    await supabase.from('questions').delete().eq('concept_id', conceptId)
+    await supabase.from('mastery').delete().eq('concept_id', conceptId)
+    await supabase.from('study_plan_items').delete().eq('concept_id', conceptId)
+    const { error } = await supabase.from('concepts').delete().eq('id', conceptId)
+    if (error) throw error
+  } else {
+    mockDb.setQuestions(mockDb.getQuestions().filter(q => q.concept_id !== conceptId))
+    mockDb.setMastery(mockDb.getMastery().filter(m => m.concept_id !== conceptId))
+    mockDb.setStudyPlan(mockDb.getStudyPlan().filter(sp => sp.concept_id !== conceptId))
+    mockDb.setConcepts(mockDb.getConcepts().filter(c => c.id !== conceptId))
+  }
+}
+
+export async function dbDeleteMaterial(materialId: string): Promise<void> {
+  if (isSupabaseConfigured()) {
+    const supabase = getSupabaseClient()!
+    const { data: relatedConcepts } = await supabase.from('concepts').select('id').eq('material_id', materialId)
+    if (relatedConcepts && relatedConcepts.length > 0) {
+      for (const c of relatedConcepts) {
+        await dbDeleteConcept(c.id)
+      }
+    }
+    const { error } = await supabase.from('materials').delete().eq('id', materialId)
+    if (error) throw error
+  } else {
+    const conceptsToDelete = mockDb.getConcepts().filter(c => c.material_id === materialId)
+    for (const c of conceptsToDelete) {
+      await dbDeleteConcept(c.id)
+    }
+    mockDb.setMaterials(mockDb.getMaterials().filter(m => m.id !== materialId))
   }
 }
 

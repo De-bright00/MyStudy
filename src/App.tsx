@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { 
   BookOpen, 
   Award, 
@@ -21,7 +21,12 @@ import {
   AlertTriangle,
   Clock,
   Menu,
-  X
+  X,
+  UploadCloud,
+  Trash2,
+  Sliders,
+  CheckCircle,
+  FileCheck
 } from 'lucide-react'
 
 // Import config and clients
@@ -29,6 +34,8 @@ import { getSupabaseClient, isSupabaseConfigured } from './lib/supabase'
 import { 
   extractConcepts, 
   generateQuestions, 
+  generateQuestionsFromMaterial,
+  type QuestionSettingType,
   evaluateAnswer, 
   checkGuidedHelpGuardrail,
   generateStudyPlanReason
@@ -46,6 +53,8 @@ import {
   dbCreateConcepts,
   dbFetchQuestions,
   dbCreateQuestions,
+  dbFetchQuestionsForSubject,
+  dbDeleteConcept,
   dbFetchAttempts,
   dbCreateAttempt,
   dbFetchMastery,
@@ -129,10 +138,17 @@ export default function App() {
   const [activeQuestionIdx, setActiveQuestionIdx] = useState(0)
   const [studentAnswer, setStudentAnswer] = useState('')
   const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false)
-  const [quizFeedback, setQuizFeedback] = useState<{ is_correct: boolean; feedback: string } | null>(null)
+  const [quizFeedback, setQuizFeedback] = useState<{
+    is_correct: boolean
+    score_percentage?: number
+    feedback: string
+    strengths?: string
+    missing_points?: string
+  } | null>(null)
   const [masteryChange, setMasteryChange] = useState<number | null>(null)
   const [testCorrectCount, setTestCorrectCount] = useState(0)
   const [flashcardRevealed, setFlashcardRevealed] = useState(false)
+  const [isMaterialAssessment, setIsMaterialAssessment] = useState(false)
 
   // Creation/Form States
   const [newSubjectName, setNewSubjectName] = useState('')
@@ -140,10 +156,20 @@ export default function App() {
   
   const [materialTitle, setMaterialTitle] = useState('')
   const [rawText, setRawText] = useState('')
-  const [sourceType, setSourceType] = useState<'paste' | 'upload' | 'topic_only'>('paste')
+  const [sourceType, setSourceType] = useState<'paste' | 'upload' | 'topic_only'>('upload')
   const [topicOnlyName, setTopicOnlyName] = useState('')
   const [isAddingMaterial, setIsAddingMaterial] = useState(false)
   const [materialLoadingState, setMaterialLoadingState] = useState<string>('') // loading description
+  
+  // File Upload Dropzone State
+  const [uploadedFileName, setUploadedFileName] = useState('')
+  const [uploadedFileSize, setUploadedFileSize] = useState('')
+  const [isDragOver, setIsDragOver] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Assessment / Question Generation Settings
+  const [materialQuestionCount, setMaterialQuestionCount] = useState<number>(5)
+  const [materialQuestionType, setMaterialQuestionType] = useState<QuestionSettingType>('mixed')
   
   // Study view control
   const [explainSimpler, setExplainSimpler] = useState(false)
@@ -405,12 +431,14 @@ export default function App() {
   }
 
   // File Upload parser (client side reader)
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
+  const processUploadedFile = async (file: File) => {
     if (!file) return
-    
     const title = file.name.replace(/\.[^/.]+$/, "")
     setMaterialTitle(title)
+    setUploadedFileName(file.name)
+    const sizeInKb = (file.size / 1024).toFixed(1)
+    const sizeStr = file.size > 1024 * 1024 ? `${(file.size / (1024 * 1024)).toFixed(2)} MB` : `${sizeInKb} KB`
+    setUploadedFileSize(sizeStr)
     setRawText("Reading and parsing document, please wait...")
     
     try {
@@ -421,6 +449,38 @@ export default function App() {
       alert(err.message || "Failed to extract text from file.")
       setRawText("")
       setMaterialTitle("")
+      setUploadedFileName("")
+      setUploadedFileSize("")
+    }
+  }
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) processUploadedFile(file)
+  }
+
+  const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    setIsDragOver(false)
+    const file = e.dataTransfer.files?.[0]
+    if (file) processUploadedFile(file)
+  }
+
+  const handleDeleteConcept = async (conceptId: string, conceptName: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!confirm(`Are you sure you want to delete concept "${conceptName}" and its questions?`)) return
+    try {
+      await dbDeleteConcept(conceptId)
+      setConcepts(prev => prev.filter(c => c.id !== conceptId))
+      if (currentConcept?.id === conceptId) {
+        setCurrentConcept(concepts.find(c => c.id !== conceptId) || null)
+      }
+      loadUserData()
+      if (currentSubject) {
+        await loadSubjectDetails(currentSubject.id)
+      }
+    } catch (err: any) {
+      alert('Failed to delete concept: ' + err.message)
     }
   }
 
@@ -462,7 +522,7 @@ export default function App() {
       setMaterialLoadingState('Step 2: Saving material details...')
       const newMat = await dbCreateMaterial(currentSubject.id, titleToSubmit, contentToSubmit, sourceType)
       
-      setMaterialLoadingState('Step 3: AI is extracting key study concepts (using Gemini)...')
+      setMaterialLoadingState('Step 3: AI is extracting key study concepts (Gemini 3.6)...')
       const extracted = await extractConcepts(contentToSubmit)
 
       if (extracted.length === 0) {
@@ -472,18 +532,34 @@ export default function App() {
       setMaterialLoadingState('Step 4: Creating study concepts...')
       const newConcepts = await dbCreateConcepts(extracted, newMat.id, currentSubject.id)
 
-      setMaterialLoadingState('Step 5: Pre-generating practice questions per concept...')
-      // Generate questions for each extracted concept in the background
-      for (const concept of newConcepts) {
-        try {
+      setMaterialLoadingState(`Step 5: Generating ${materialQuestionCount} ${materialQuestionType.toUpperCase()} questions directly from your material...`)
+      
+      try {
+        const generatedQs = await generateQuestionsFromMaterial(
+          titleToSubmit,
+          contentToSubmit,
+          materialQuestionCount,
+          materialQuestionType,
+          extracted
+        )
+
+        if (generatedQs.length > 0 && newConcepts.length > 0) {
+          // Distribute questions among extracted concepts
+          for (let i = 0; i < generatedQs.length; i++) {
+            const q = generatedQs[i]
+            const matchedConcept = newConcepts.find(c => c.name.toLowerCase() === q.concept_name?.toLowerCase()) || newConcepts[i % newConcepts.length]
+            await dbCreateQuestions([q], matchedConcept.id)
+          }
+        }
+      } catch (genErr) {
+        console.warn('Material question generation warning, falling back to per-concept generation:', genErr)
+        for (const concept of newConcepts) {
           const matchingConcept = extracted.find(e => e.name.toLowerCase() === concept.name.toLowerCase())
           const summary = matchingConcept ? matchingConcept.summary : concept.summary
-          const generatedQs = await generateQuestions(concept.name, summary)
-          if (generatedQs.length > 0) {
-            await dbCreateQuestions(generatedQs, concept.id)
+          const fallbackQs = await generateQuestions(concept.name, summary)
+          if (fallbackQs.length > 0) {
+            await dbCreateQuestions(fallbackQs, concept.id)
           }
-        } catch (qErr) {
-          console.error(`Failed to pre-generate questions for concept "${concept.name}":`, qErr)
         }
       }
 
@@ -491,12 +567,14 @@ export default function App() {
       setRawText('')
       setMaterialTitle('')
       setTopicOnlyName('')
+      setUploadedFileName('')
+      setUploadedFileSize('')
       
       // Reload UI Data
       await loadSubjectDetails(currentSubject.id)
       await loadUserData()
       
-      alert(`Success! Extracted ${newConcepts.length} concepts and generated practice questions. You can start practicing!`)
+      alert(`Success! Extracted ${newConcepts.length} concepts and generated ${materialQuestionCount} ${materialQuestionType} questions directly from your material.`)
     } catch (err: any) {
       console.error(err)
       alert(err.message || 'Failed to process study material')
@@ -509,6 +587,8 @@ export default function App() {
   // --- PRACTICE / QUIZ FLOW ---
   const startPractice = async (concept: Concept) => {
     setIsPracticing(true)
+    setIsMaterialAssessment(false)
+    setActiveTest(null)
     setQuizQuestions([])
     setActiveQuestionIdx(0)
     setStudentAnswer('')
@@ -527,15 +607,12 @@ export default function App() {
         qs = await dbCreateQuestions(generatedQs, concept.id)
       }
 
-      // Filter by dynamic difficulty: target = round(mastery_score / 20) clamped to 1-5, search within ±1
+      // Dynamic difficulty targeting
       const conceptMastery = masteries.find(m => m.concept_id === concept.id)
       const currentScore = conceptMastery ? getDecayedMastery(conceptMastery.score, conceptMastery.last_updated) : 50
       const targetDiff = getTargetDifficulty(currentScore)
       
-      // Filter questions within targetDiff ± 1
       let filteredQs = qs.filter(q => Math.abs(q.difficulty - targetDiff) <= 1)
-      
-      // If no questions match the target range, fallback to all questions
       if (filteredQs.length === 0) {
         filteredQs = qs
       }
@@ -547,6 +624,37 @@ export default function App() {
     } catch (err: any) {
       console.error(err)
       alert('Could not start practice session: ' + err.message)
+      setIsPracticing(false)
+    }
+  }
+
+  const startMaterialAssessment = async (subject: Subject) => {
+    setIsPracticing(true)
+    setIsMaterialAssessment(true)
+    setActiveTest(null)
+    setQuizQuestions([])
+    setActiveQuestionIdx(0)
+    setStudentAnswer('')
+    setQuizFeedback(null)
+    setMasteryChange(null)
+    setFlashcardRevealed(false)
+
+    try {
+      const allQs = await dbFetchQuestionsForSubject(subject.id)
+      if (allQs.length === 0) {
+        alert('No assessment questions found for this subject. Add study material to generate questions first.')
+        setIsPracticing(false)
+        return
+      }
+
+      const shuffled = [...allQs].sort(() => 0.5 - Math.random())
+      setQuizQuestions(shuffled)
+      if (concepts.length > 0) {
+        setCurrentConcept(concepts[0])
+      }
+    } catch (err: any) {
+      console.error(err)
+      alert('Could not start material assessment: ' + err.message)
       setIsPracticing(false)
     }
   }
@@ -564,13 +672,17 @@ export default function App() {
       let feedbackText = ''
 
       if (activeQ.question_type === 'flashcard') {
-        // Flashcard is graded manually by the student using the buttons
-        // Handled in a separate function
         return
       }
 
-      // MCQ or Short Answer: Grade via AI
-      const grading = await evaluateAnswer(activeQ.prompt, activeQ.correct_answer, studentAnswer.trim())
+      // MCQ or Short Answer/Theory/Body: Grade via AI with conceptual understanding
+      const grading = await evaluateAnswer(
+        activeQ.prompt,
+        activeQ.correct_answer,
+        studentAnswer.trim(),
+        activeQ.sub_type || activeQ.question_type,
+        currentConcept?.summary
+      )
       isCorrect = grading.is_correct
       feedbackText = grading.feedback
 
@@ -584,20 +696,19 @@ export default function App() {
           setTestCorrectCount(newCorrectCount)
         }
 
-        // If guidance is disabled, we skip displaying feedback and immediately go to next question
+        // If guidance is disabled, skip feedback and proceed
         if (activeTest.disable_guidance) {
           if (activeQuestionIdx + 1 < quizQuestions.length) {
             setActiveQuestionIdx(prev => prev + 1)
             setStudentAnswer('')
             setQuizFeedback(null)
           } else {
-            // Test completed!
             const finalScore = Math.round((newCorrectCount / quizQuestions.length) * 100)
             await dbSubmitTestGrade(uId, activeTest.id, finalScore)
             
-            // Show score page
             setQuizFeedback({
               is_correct: finalScore >= 50,
+              score_percentage: finalScore,
               feedback: `Test Completed! You scored ${finalScore}% (${newCorrectCount} / ${quizQuestions.length} correct answers).`
             })
           }
@@ -617,7 +728,13 @@ export default function App() {
         setMasteryChange(updatedMastery.score - oldScore)
       }
 
-      setQuizFeedback({ is_correct: isCorrect, feedback: feedbackText })
+      setQuizFeedback({
+        is_correct: isCorrect,
+        score_percentage: grading.score_percentage,
+        feedback: feedbackText,
+        strengths: grading.strengths,
+        missing_points: grading.missing_points
+      })
 
       // Reload global masteries
       loadUserData()
@@ -1008,8 +1125,8 @@ export default function App() {
             <>
               <button
                 onClick={() => { setActiveTab('dashboard'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'dashboard' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'dashboard' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <Compass className={`h-5 w-5 ${activeTab === 'dashboard' ? 'text-white' : 'text-slate-500'}`} />
@@ -1018,8 +1135,8 @@ export default function App() {
 
               <button
                 onClick={() => { setActiveTab('study'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'study' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'study' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <BookOpen className={`h-5 w-5 ${activeTab === 'study' ? 'text-white' : 'text-slate-500'}`} />
@@ -1028,8 +1145,8 @@ export default function App() {
 
               <button
                 onClick={() => { setActiveTab('tests'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'tests' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'tests' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <FileText className={`h-5 w-5 ${activeTab === 'tests' ? 'text-white' : 'text-slate-500'}`} />
@@ -1040,8 +1157,8 @@ export default function App() {
             <>
               <button
                 onClick={() => { setActiveTab('dashboard'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'dashboard' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'dashboard' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <Compass className={`h-5 w-5 ${activeTab === 'dashboard' ? 'text-white' : 'text-slate-500'}`} />
@@ -1050,8 +1167,8 @@ export default function App() {
 
               <button
                 onClick={() => { setActiveTab('studyplan'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'studyplan' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'studyplan' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <Calendar className={`h-5 w-5 ${activeTab === 'studyplan' ? 'text-white' : 'text-slate-500'}`} />
@@ -1060,8 +1177,8 @@ export default function App() {
 
               <button
                 onClick={() => { setActiveTab('progress'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer hover:scale-[1.02] ${
-                  activeTab === 'progress' ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-500/10' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:translate-x-1 ${
+                  activeTab === 'progress' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                 }`}
               >
                 <Award className={`h-5 w-5 ${activeTab === 'progress' ? 'text-white' : 'text-slate-500'}`} />
@@ -1137,18 +1254,20 @@ export default function App() {
         
         {/* IF CURRENTLY TAKING A PRACTICE SESSION (FULLSCREEN MODAL OVERLAY INSTEAD OF TABS) */}
         {isPracticing && quizQuestions.length > 0 && (
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xl p-6 md:p-8 mb-8 animate-fadeIn">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xl p-6 md:p-8 mb-8 animate-slideUp">
             {/* Header */}
             <div className="flex justify-between items-center pb-4 border-b border-slate-100 mb-6">
               <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-violet-600 bg-violet-50 px-2.5 py-1 rounded-lg">
-                  {activeTest ? 'Test Assessment' : 'Practice Session'}
+                <span className="text-xs font-bold uppercase tracking-wider text-indigo-700 bg-indigo-50 border border-indigo-100 px-3 py-1 rounded-lg">
+                  {activeTest ? 'Test Assessment' : isMaterialAssessment ? 'Material Assessment' : 'Concept Practice'}
                 </span>
-                <h2 className="text-xl font-bold text-slate-900 mt-1">{activeTest ? activeTest.title : currentConcept?.name}</h2>
+                <h2 className="text-xl font-black text-slate-900 mt-1">
+                  {activeTest ? activeTest.title : isMaterialAssessment ? `${currentSubject?.name || 'Subject'} Full Assessment` : currentConcept?.name}
+                </h2>
               </div>
               <button 
-                onClick={() => { if (confirm(activeTest ? 'Abort test? Progress will not be saved.' : 'Abort practice? Current score will not be saved.')) setIsPracticing(false); }}
-                className="text-slate-400 hover:text-slate-600"
+                onClick={() => { if (confirm(activeTest ? 'Abort test? Progress will not be saved.' : 'Abort session? Current score will not be saved.')) setIsPracticing(false); }}
+                className="text-slate-400 hover:text-slate-700 text-xs font-semibold cursor-pointer px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors"
               >
                 Quit Session
               </button>
@@ -1156,41 +1275,70 @@ export default function App() {
 
             {/* Progress indicator */}
             <div className="mb-6">
-              <div className="flex justify-between text-xs text-slate-500 mb-1">
+              <div className="flex justify-between text-xs text-slate-500 mb-1 font-semibold">
                 <span>Question {activeQuestionIdx + 1} of {quizQuestions.length}</span>
                 <span>Difficulty {quizQuestions[activeQuestionIdx].difficulty} / 5</span>
               </div>
-              <div className="w-full bg-slate-100 rounded-full h-1.5">
+              <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                 <div 
-                  className="bg-violet-600 h-1.5 rounded-full transition-all duration-300"
+                  className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
                   style={{ width: `${((activeQuestionIdx + 1) / quizQuestions.length) * 100}%` }}
                 ></div>
               </div>
             </div>
 
+            {/* Question Type Header & Meta */}
+            <div className="flex items-center gap-2 mb-3">
+              {quizQuestions[activeQuestionIdx].sub_type === 'objective' || quizQuestions[activeQuestionIdx].question_type === 'mcq' ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200">
+                  <CheckCircle className="h-3.5 w-3.5" /> Objective (Multiple Choice)
+                </span>
+              ) : quizQuestions[activeQuestionIdx].sub_type === 'body' ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-purple-50 text-purple-700 border border-purple-200">
+                  <FileText className="h-3.5 w-3.5" /> Body (In-Depth / Essay Question)
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                  <Brain className="h-3.5 w-3.5" /> Theory (Conceptual Question)
+                </span>
+              )}
+              {quizQuestions[activeQuestionIdx].concept_name && (
+                <span className="text-xs text-slate-500 font-medium">
+                  • Concept: {quizQuestions[activeQuestionIdx].concept_name}
+                </span>
+              )}
+            </div>
+
             {/* Question Box */}
-            <div className="bg-slate-50 rounded-xl p-5 border border-slate-100 mb-6">
-              <p className="text-lg font-semibold text-slate-800">
+            <div className="bg-slate-50 rounded-xl p-5 border border-slate-200 mb-6">
+              <p className="text-lg font-bold text-slate-900 leading-relaxed">
                 {quizQuestions[activeQuestionIdx].prompt}
               </p>
             </div>
 
             {/* Answer Input depending on question type */}
             <div className="space-y-4">
-              {quizQuestions[activeQuestionIdx].question_type === 'mcq' && (
+              {(quizQuestions[activeQuestionIdx].sub_type === 'objective' || quizQuestions[activeQuestionIdx].question_type === 'mcq') && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {quizQuestions[activeQuestionIdx].options?.map((option, idx) => (
                     <button
                       key={idx}
                       disabled={!!quizFeedback}
                       onClick={() => setStudentAnswer(option)}
-                      className={`text-left p-4 rounded-xl text-sm font-semibold transition-all border shadow-sm cursor-pointer ${
+                      className={`text-left p-4 rounded-xl text-sm font-semibold transition-all border shadow-sm cursor-pointer hover:-translate-y-0.5 ${
                         studentAnswer === option 
-                          ? 'border-violet-600 bg-violet-50 text-violet-800 ring-2 ring-violet-500/20' 
+                          ? 'border-indigo-600 bg-indigo-50/80 text-indigo-950 ring-2 ring-indigo-500/20' 
                           : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                       }`}
                     >
-                      {option}
+                      <div className="flex items-center gap-2.5">
+                        <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                          studentAnswer === option ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'
+                        }`}>
+                          {String.fromCharCode(65 + idx)}
+                        </span>
+                        <span>{option}</span>
+                      </div>
                     </button>
                   ))}
                 </div>
@@ -1198,14 +1346,30 @@ export default function App() {
 
               {quizQuestions[activeQuestionIdx].question_type === 'short_answer' && (
                 <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+                      {quizQuestions[activeQuestionIdx].sub_type === 'body' ? 'Your In-Depth Explanation / Essay Answer:' : 'Your Conceptual Answer:'}
+                    </span>
+                    <span className="text-xs text-indigo-600 font-semibold">
+                      Answer in your own words (understanding is graded, not verbatim text)
+                    </span>
+                  </div>
                   <textarea
-                    rows={3}
+                    rows={quizQuestions[activeQuestionIdx].sub_type === 'body' ? 7 : 4}
                     disabled={!!quizFeedback}
-                    placeholder="Type your explanation here..."
+                    placeholder={
+                      quizQuestions[activeQuestionIdx].sub_type === 'body'
+                        ? "Provide a structured, comprehensive explanation in your own words based on what you learned from the material..."
+                        : "Explain the key idea in your own words (exact copy-pasting is not required)..."
+                    }
                     value={studentAnswer}
                     onChange={(e) => setStudentAnswer(e.target.value)}
-                    className="w-full p-4 border border-slate-300 rounded-xl shadow-sm focus:ring-2 focus:ring-violet-500 focus:border-violet-500 text-sm font-medium"
+                    className="w-full p-4 border border-slate-300 rounded-xl shadow-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm font-medium leading-relaxed"
                   />
+                  <div className="flex justify-between items-center text-xs text-slate-400 mt-1">
+                    <span>{studentAnswer.trim().split(/\s+/).filter(Boolean).length} words</span>
+                    <span>{studentAnswer.length} characters</span>
+                  </div>
                 </div>
               )}
 
@@ -1214,14 +1378,14 @@ export default function App() {
                   {!flashcardRevealed ? (
                     <button
                       onClick={() => setFlashcardRevealed(true)}
-                      className="w-full max-w-md py-12 px-6 bg-white hover:bg-slate-50 border border-slate-200 rounded-2xl shadow-md text-center cursor-pointer font-bold text-violet-700 text-xl flex items-center justify-center gap-2"
+                      className="w-full max-w-md py-12 px-6 bg-white hover:bg-slate-50 border border-slate-200 rounded-2xl shadow-md text-center cursor-pointer font-bold text-indigo-700 text-xl flex items-center justify-center gap-2 hover:-translate-y-0.5 transition-all"
                     >
                       <RotateCcw className="h-5 w-5 animate-spin-slow" />
                       Click to Reveal Back
                     </button>
                   ) : (
-                    <div className="w-full max-w-md bg-violet-50 border border-violet-200 rounded-2xl p-6 shadow-md text-center animate-fadeIn">
-                      <p className="text-xs font-semibold uppercase text-violet-600 mb-2">Back of Card / Explanation</p>
+                    <div className="w-full max-w-md bg-indigo-50/60 border border-indigo-200 rounded-2xl p-6 shadow-md text-center animate-slideUp">
+                      <p className="text-xs font-semibold uppercase text-indigo-700 mb-2">Back of Card / Explanation</p>
                       <p className="text-slate-800 font-semibold mb-6">{quizQuestions[activeQuestionIdx].correct_answer}</p>
                       
                       {!quizFeedback && (
@@ -1234,7 +1398,7 @@ export default function App() {
                           </button>
                           <button
                             onClick={() => handleFlashcardGrade(true)}
-                            className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-sm font-bold flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
                           >
                             <CheckCircle2 className="h-4 w-4" /> I recalled correctly
                           </button>
@@ -1251,52 +1415,81 @@ export default function App() {
                   <button
                     onClick={handleAnswerSubmit}
                     disabled={isSubmittingAnswer || !studentAnswer.trim()}
-                    className="px-6 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-sm font-bold rounded-xl shadow-md transition-colors disabled:opacity-50 flex items-center gap-2 cursor-pointer"
+                    className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-xl shadow-sm transition-all disabled:opacity-50 flex items-center gap-2 cursor-pointer hover:-translate-y-0.5 active:scale-95"
                   >
-                    {isSubmittingAnswer ? 'Evaluating Answer...' : 'Submit Answer'}
+                    {isSubmittingAnswer ? 'Evaluating Conceptual Understanding...' : 'Submit Answer'}
                     <ChevronRight className="h-4 w-4" />
                   </button>
                 </div>
               )}
 
-              {/* Feedback Block */}
+              {/* Feedback Block with Conceptual Grading */}
               {quizFeedback && (
-                <div className="mt-6 border border-slate-200 rounded-xl p-5 shadow-sm animate-slideUp">
-                  <div className="flex items-start gap-3">
+                <div className="mt-6 border border-slate-200 rounded-2xl p-6 shadow-sm bg-white animate-slideUp">
+                  <div className="flex items-start gap-3.5">
                     {quizFeedback.is_correct ? (
-                      <CheckCircle2 className="h-6 w-6 text-emerald-600 shrink-0 mt-0.5" />
+                      <CheckCircle2 className="h-7 w-7 text-emerald-600 shrink-0 mt-0.5" />
                     ) : (
-                      <XCircle className="h-6 w-6 text-rose-600 shrink-0 mt-0.5" />
+                      <XCircle className="h-7 w-7 text-rose-600 shrink-0 mt-0.5" />
                     )}
                     <div className="flex-1">
-                      <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-                        {quizFeedback.is_correct ? 'Correct! Well Done.' : 'Incorrect attempt'}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h4 className="text-base font-bold text-slate-900">
+                          {quizFeedback.is_correct ? 'Correct! Strong Understanding' : 'Needs Review'}
+                        </h4>
+                        {quizFeedback.score_percentage !== undefined && (
+                          <span className={`text-xs px-2.5 py-0.5 rounded-full font-bold border ${
+                            quizFeedback.score_percentage >= 70 
+                              ? 'text-emerald-700 bg-emerald-50 border-emerald-200' 
+                              : quizFeedback.score_percentage >= 50
+                              ? 'text-amber-700 bg-amber-50 border-amber-200'
+                              : 'text-rose-700 bg-rose-50 border-rose-200'
+                          }`}>
+                            {quizFeedback.score_percentage}% Conceptual Score
+                          </span>
+                        )}
                         {masteryChange !== null && (
                           <span className={`text-xs px-2 py-0.5 rounded font-bold ${masteryChange >= 0 ? 'text-emerald-700 bg-emerald-50' : 'text-rose-700 bg-rose-50'}`}>
                             {masteryChange >= 0 ? `+${masteryChange}` : `${masteryChange}`} Mastery
                           </span>
                         )}
-                      </h4>
+                      </div>
                       
-                      {/* Socratic Feedback */}
-                      <p className="mt-2 text-sm text-slate-600 leading-relaxed font-medium">
+                      {/* Socratic / Understanding Feedback */}
+                      <p className="mt-2.5 text-sm text-slate-700 leading-relaxed font-medium">
                         {quizFeedback.feedback}
                       </p>
 
-                      {/* Display correct answer helper ONLY for Short Answer when incorrect, to help them compare, but keep it educative */}
-                      {!quizFeedback.is_correct && quizQuestions[activeQuestionIdx].question_type === 'short_answer' && (
-                        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs">
-                          <span className="font-semibold text-slate-500 block mb-1">Concept Benchmark Answer:</span>
-                          <span className="text-slate-700 font-medium">{quizQuestions[activeQuestionIdx].correct_answer}</span>
+                      {/* Strengths */}
+                      {quizFeedback.strengths && (
+                        <div className="mt-3 p-3 bg-emerald-50/70 border border-emerald-200/80 rounded-xl text-xs text-emerald-900">
+                          <span className="font-bold block text-[10px] uppercase text-emerald-700 mb-0.5">What you grasped well:</span>
+                          <span>{quizFeedback.strengths}</span>
+                        </div>
+                      )}
+
+                      {/* Missing Points */}
+                      {quizFeedback.missing_points && (
+                        <div className="mt-2.5 p-3 bg-amber-50/70 border border-amber-200/80 rounded-xl text-xs text-amber-900">
+                          <span className="font-bold block text-[10px] uppercase text-amber-700 mb-0.5">Nuances or concepts to refine:</span>
+                          <span>{quizFeedback.missing_points}</span>
+                        </div>
+                      )}
+
+                      {/* Material Benchmark Reference */}
+                      {quizQuestions[activeQuestionIdx].question_type === 'short_answer' && (
+                        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs">
+                          <span className="font-bold text-slate-500 block mb-1">Source Material Benchmark:</span>
+                          <span className="text-slate-800 font-medium leading-relaxed block">{quizQuestions[activeQuestionIdx].correct_answer}</span>
                         </div>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex justify-end pt-4 border-t border-slate-100 mt-4">
+                  <div className="flex justify-end pt-4 border-t border-slate-100 mt-5">
                     <button
                       onClick={handleNextQuizQuestion}
-                      className="px-6 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-colors cursor-pointer"
+                      className="px-6 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer hover:-translate-y-0.5 active:scale-95"
                     >
                       {activeQuestionIdx + 1 < quizQuestions.length ? 'Next Question' : 'Complete Session'}
                     </button>
@@ -1369,7 +1562,7 @@ export default function App() {
                               setCurrentSubject(sub)
                               setActiveTab('study')
                             }}
-                            className="flex-1 py-2 px-3 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 hover:scale-[1.02] active:scale-[0.98] text-white rounded-xl text-xs font-bold shadow-sm shadow-indigo-500/10 text-center cursor-pointer transition-all duration-200"
+                            className="flex-1 py-2 px-3 bg-indigo-600 hover:bg-indigo-700 hover:scale-[1.02] active:scale-[0.98] text-white rounded-xl text-xs font-bold shadow-sm text-center cursor-pointer transition-all duration-200"
                           >
                             Study Materials
                           </button>
@@ -1459,7 +1652,7 @@ export default function App() {
                     <button
                       type="submit"
                       disabled={isJoiningTest}
-                      className="px-6 py-2.5 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-sm font-bold shadow-md shadow-indigo-500/10 cursor-pointer disabled:opacity-50 transition-colors shrink-0"
+                      className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold shadow-sm cursor-pointer disabled:opacity-50 transition-colors shrink-0"
                     >
                       {isJoiningTest ? 'Joining...' : 'Join Assessment'}
                     </button>
@@ -1593,7 +1786,7 @@ export default function App() {
                                   setCurrentSubject(sub)
                                   setActiveTab('study')
                                 }}
-                                className="flex-1 py-2 px-3 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold text-center cursor-pointer transition-all"
+                                className="flex-1 py-2 px-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold text-center cursor-pointer transition-all"
                               >
                                 Study Materials
                               </button>
@@ -1701,34 +1894,34 @@ export default function App() {
                     <p className="text-sm font-bold text-slate-700 animate-pulse">{materialLoadingState}</p>
                   </div>
                 ) : (
-                  <form onSubmit={handleAddMaterial} className="space-y-4">
+                  <form onSubmit={handleAddMaterial} className="space-y-5">
                     {/* Source type tabs */}
                     <div>
                       <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Input Source Type</label>
                       <div className="flex gap-2">
                         <button
                           type="button"
+                          onClick={() => setSourceType('upload')}
+                          className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                            sourceType === 'upload' ? 'border-indigo-600 bg-indigo-50 text-indigo-700 shadow-sm' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                          }`}
+                        >
+                          Upload File (PDF, DOCX, PPTX, TXT, MD)
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => setSourceType('paste')}
                           className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                            sourceType === 'paste' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                            sourceType === 'paste' ? 'border-indigo-600 bg-indigo-50 text-indigo-700 shadow-sm' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
                           }`}
                         >
                           Paste Notes/Text
                         </button>
                         <button
                           type="button"
-                          onClick={() => setSourceType('upload')}
-                          className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                            sourceType === 'upload' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
-                          }`}
-                        >
-                          Upload File (PDF, DOC/X, PPTX, TXT, MD)
-                        </button>
-                        <button
-                          type="button"
                           onClick={() => setSourceType('topic_only')}
                           className={`flex-1 py-2 px-3 border rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                            sourceType === 'topic_only' ? 'border-violet-600 bg-violet-50 text-violet-700' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                            sourceType === 'topic_only' ? 'border-indigo-600 bg-indigo-50 text-indigo-700 shadow-sm' : 'border-slate-200 hover:bg-slate-50 text-slate-600'
                           }`}
                         >
                           Topic Only (No materials)
@@ -1736,6 +1929,103 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* UPLOAD FILE TAB WITH INTERACTIVE CLICKABLE GRID BOX */}
+                    {sourceType === 'upload' && (
+                      <div className="space-y-3">
+                        <input
+                          type="file"
+                          ref={fileInputRef}
+                          id="file-upload-input"
+                          accept=".txt,.md,.json,.pdf,.docx,.pptx,.doc"
+                          onChange={handleFileUpload}
+                          className="hidden"
+                        />
+
+                        {/* Clickable Grid Box / Dropzone Tile */}
+                        <div
+                          onClick={() => fileInputRef.current?.click()}
+                          onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+                          onDragLeave={() => setIsDragOver(false)}
+                          onDrop={handleFileDrop}
+                          className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all duration-200 group ${
+                            isDragOver
+                              ? 'border-indigo-600 bg-indigo-50/80 ring-4 ring-indigo-500/10'
+                              : 'border-indigo-300 bg-indigo-50/20 hover:bg-indigo-50/50 hover:border-indigo-600'
+                          }`}
+                        >
+                          <div className="w-14 h-14 mx-auto mb-3 bg-indigo-100 text-indigo-600 rounded-2xl flex items-center justify-center group-hover:bg-indigo-600 group-hover:text-white group-hover:scale-105 transition-all shadow-sm">
+                            <UploadCloud className="h-7 w-7" />
+                          </div>
+
+                          <h4 className="text-sm font-bold text-slate-800 group-hover:text-indigo-900 transition-colors">
+                            Click here to add study material, or drag & drop file
+                          </h4>
+                          <p className="text-xs text-slate-500 mt-1">
+                            Click anywhere inside this box to browse files from your device
+                          </p>
+
+                          <div className="mt-3.5 inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 group-hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm transition-all hover:scale-105">
+                            <Plus className="h-4 w-4" /> Select File from Device
+                          </div>
+
+                          {/* Format tags grid */}
+                          <div className="mt-4 flex items-center justify-center gap-1.5 flex-wrap">
+                            {['PDF', 'Word (.docx)', 'PowerPoint (.pptx)', 'Text (.txt)', 'Markdown (.md)'].map(format => (
+                              <span key={format} className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-white border border-slate-200 text-slate-600 shadow-2xs">
+                                {format}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Selected file confirmation & preview */}
+                        {uploadedFileName && (
+                          <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 space-y-2 animate-fadeIn">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2.5">
+                                <FileCheck className="h-5 w-5 text-emerald-600 shrink-0" />
+                                <div>
+                                  <span className="text-xs font-bold text-slate-800 block truncate max-w-xs">{uploadedFileName}</span>
+                                  <span className="text-[10px] text-slate-400 font-medium">{uploadedFileSize} • Parsed & ready</span>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => fileInputRef.current?.click()}
+                                className="text-xs text-indigo-600 font-bold hover:underline cursor-pointer"
+                              >
+                                Replace File
+                              </button>
+                            </div>
+
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">Material Title</label>
+                              <input
+                                type="text"
+                                required
+                                placeholder="Material Title"
+                                value={materialTitle}
+                                onChange={(e) => setMaterialTitle(e.target.value)}
+                                className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                              />
+                            </div>
+
+                            {rawText && (
+                              <div className="mt-2 bg-white p-3 rounded-lg border border-slate-200 text-left max-h-36 overflow-y-auto">
+                                <span className="text-[10px] font-bold text-slate-400 block mb-1">
+                                  Extracted Content Preview ({rawText.length} characters):
+                                </span>
+                                <span className="text-xs font-medium text-slate-700 block whitespace-pre-wrap leading-relaxed">
+                                  {rawText.slice(0, 400)}...
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* PASTE NOTES TAB */}
                     {sourceType === 'paste' && (
                       <div className="space-y-3">
                         <div>
@@ -1746,7 +2036,7 @@ export default function App() {
                             placeholder="e.g. Chapter 4: Photosynthesis Notes"
                             value={materialTitle}
                             onChange={(e) => setMaterialTitle(e.target.value)}
-                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500"
+                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
                           />
                         </div>
                         <div>
@@ -1757,31 +2047,13 @@ export default function App() {
                             placeholder="Paste chapters, lecture notes, definitions, or general text..."
                             value={rawText}
                             onChange={(e) => setRawText(e.target.value)}
-                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium"
+                            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-indigo-500 focus:border-indigo-500 font-medium bg-white"
                           />
                         </div>
                       </div>
                     )}
 
-                    {sourceType === 'upload' && (
-                      <div className="space-y-3 border-2 border-dashed border-slate-200 rounded-xl p-6 text-center">
-                        <FileText className="h-10 w-10 text-slate-400 mx-auto mb-2" />
-                        <span className="text-xs text-slate-500 block mb-2">Upload study document (PDF, DOC, DOCX, PPTX, TXT, MD)</span>
-                        <input
-                          type="file"
-                          accept=".txt,.md,.json,.pdf,.docx,.pptx,.doc"
-                          onChange={handleFileUpload}
-                          className="mx-auto block text-xs text-slate-500"
-                        />
-                        {rawText && (
-                          <div className="mt-4 bg-slate-50 p-3 rounded-lg border border-slate-100 text-left max-h-40 overflow-y-auto">
-                            <span className="text-[10px] font-bold text-slate-400 block mb-1">File Preview: {materialTitle}</span>
-                            <span className="text-xs font-medium text-slate-700 block whitespace-pre-wrap">{rawText.slice(0, 500)}...</span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
+                    {/* TOPIC ONLY TAB */}
                     {sourceType === 'topic_only' && (
                       <div>
                         <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Topic Name</label>
@@ -1791,12 +2063,113 @@ export default function App() {
                           placeholder="e.g. Mitosis, Capitalism vs Socialism, Linear Algebra"
                           value={topicOnlyName}
                           onChange={(e) => setTopicOnlyName(e.target.value)}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-violet-500 focus:border-violet-500"
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm shadow-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
                         />
                       </div>
                     )}
 
-                    <div className="flex justify-end gap-2 pt-2">
+                    {/* ASSESSMENT & QUESTION GENERATION SETTINGS */}
+                    <div className="pt-4 border-t border-slate-200 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                            <Sliders className="h-4 w-4 text-indigo-600" />
+                            Question Setting & Assessment Configuration
+                          </h4>
+                          <p className="text-xs text-slate-500 mt-0.5">Control how many and what format of questions the AI sets from this material.</p>
+                        </div>
+                      </div>
+
+                      {/* Question Count Selector */}
+                      <div>
+                        <label className="block text-xs font-bold text-slate-600 mb-1.5">How many questions do you want from this material?</label>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {[5, 10, 15, 20].map(count => (
+                            <button
+                              key={count}
+                              type="button"
+                              onClick={() => setMaterialQuestionCount(count)}
+                              className={`px-3.5 py-1.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                                materialQuestionCount === count
+                                  ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                              }`}
+                            >
+                              {count} Questions
+                            </button>
+                          ))}
+                          <div className="flex items-center gap-1.5 pl-2">
+                            <span className="text-xs text-slate-400 font-medium">Custom:</span>
+                            <input
+                              type="number"
+                              min={1}
+                              max={30}
+                              value={materialQuestionCount}
+                              onChange={(e) => setMaterialQuestionCount(Math.max(1, Math.min(30, parseInt(e.target.value) || 1)))}
+                              className="w-16 px-2.5 py-1 text-xs font-bold border border-slate-300 rounded-lg text-center focus:ring-1 focus:ring-indigo-500 bg-white"
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Question Format / Type Selector */}
+                      <div>
+                        <label className="block text-xs font-bold text-slate-600 mb-1.5">What type of questions do you want?</label>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                          {[
+                            {
+                              id: 'objective',
+                              title: 'Objective (MCQ)',
+                              desc: 'Multiple choice with 4 options tested against facts in the material.',
+                              icon: CheckCircle2
+                            },
+                            {
+                              id: 'theory',
+                              title: 'Theory',
+                              desc: 'Conceptual short-answer questions testing principles and understanding.',
+                              icon: Brain
+                            },
+                            {
+                              id: 'body',
+                              title: 'Body / Essay',
+                              desc: 'Structured, in-depth analytical questions testing comprehensive mastery.',
+                              icon: FileText
+                            },
+                            {
+                              id: 'mixed',
+                              title: 'Mixed / Both',
+                              desc: 'Balanced combination of Objective MCQs + Theory & Body questions.',
+                              icon: Sparkles
+                            }
+                          ].map(t => {
+                            const IconComp = t.icon
+                            const isSelected = materialQuestionType === t.id
+                            return (
+                              <button
+                                key={t.id}
+                                type="button"
+                                onClick={() => setMaterialQuestionType(t.id as QuestionSettingType)}
+                                className={`text-left p-3 rounded-xl border text-xs transition-all cursor-pointer flex flex-col justify-between ${
+                                  isSelected
+                                    ? 'border-indigo-600 bg-indigo-50/70 ring-2 ring-indigo-500/20'
+                                    : 'border-slate-200 bg-white hover:bg-slate-50'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2 mb-1">
+                                  <div className={`p-1.5 rounded-lg ${isSelected ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                                    <IconComp className="h-3.5 w-3.5" />
+                                  </div>
+                                  <span className={`font-bold ${isSelected ? 'text-indigo-950' : 'text-slate-800'}`}>{t.title}</span>
+                                </div>
+                                <p className="text-[11px] text-slate-500 leading-tight">{t.desc}</p>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
                       <button
                         type="button"
                         onClick={() => setIsAddingMaterial(false)}
@@ -1806,9 +2179,9 @@ export default function App() {
                       </button>
                       <button
                         type="submit"
-                        className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-xs font-bold shadow-md cursor-pointer transition-colors"
+                        className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer transition-all hover:-translate-y-0.5"
                       >
-                        Submit & Extract Concepts
+                        Extract Concepts & Generate Questions
                       </button>
                     </div>
                   </form>
@@ -1818,106 +2191,140 @@ export default function App() {
 
             {/* CONCEPTS STUDY CORE VIEW */}
             {currentSubject && concepts.length > 0 && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                
-                {/* Concepts list panel */}
-                <div className="lg:col-span-4 space-y-3">
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Concepts Extracted</h3>
-                  <div className="space-y-2">
-                    {concepts.map(con => {
-                      const m = masteries.find(ma => ma.concept_id === con.id)
-                      const decayedScore = m ? getDecayedMastery(m.score, m.last_updated) : 50
-                      return (
-                        <button
-                          key={con.id}
-                          onClick={() => {
-                            setCurrentConcept(con)
-                            setExplainSimpler(false)
-                          }}
-                          className={`w-full text-left p-4 rounded-xl border shadow-sm transition-all flex flex-col justify-between cursor-pointer ${
-                            currentConcept?.id === con.id
-                              ? 'border-violet-600 bg-violet-50/40 ring-1 ring-violet-500/25'
-                              : 'border-slate-200 bg-white hover:bg-slate-50'
-                          }`}
-                        >
-                          <span className="font-bold text-slate-800 truncate block">{con.name}</span>
-                          
-                          <div className="flex items-center gap-2 mt-2 w-full">
-                            <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
-                              <div 
-                                className={`h-1.5 rounded-full ${
-                                  decayedScore >= 70 ? 'bg-emerald-500' : decayedScore >= 40 ? 'bg-amber-500' : 'bg-rose-500'
-                                }`}
-                                style={{ width: `${decayedScore}%` }}
-                              ></div>
-                            </div>
-                            <span className="text-[10px] font-bold text-slate-500 shrink-0">{decayedScore}%</span>
-                          </div>
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-
-                {/* Concept Study details card */}
-                {currentConcept && (
-                  <div className="lg:col-span-8 space-y-6">
-                    <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col justify-between min-h-[300px]">
-                      <div>
-                        {/* Tab header */}
-                        <div className="flex justify-between items-center pb-4 border-b border-slate-100 mb-6">
-                          <h3 className="text-xl font-bold text-slate-900">{currentConcept.name}</h3>
-                          
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-bold text-slate-500">Explain Simpler:</span>
-                            <button
-                              onClick={() => setExplainSimpler(!explainSimpler)}
-                              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                explainSimpler ? 'bg-violet-600' : 'bg-slate-200'
-                              }`}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                                  explainSimpler ? 'translate-x-5' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Explanation Content */}
-                        <div className="space-y-6 font-medium text-slate-700 leading-relaxed text-sm">
-                          {!explainSimpler ? (
-                            <div className="space-y-4">
-                              <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Concept Summary</p>
-                              <p>{currentConcept.summary}</p>
-                            </div>
-                          ) : (
-                            <div className="space-y-4 animate-fadeIn">
-                              <div className="p-3 bg-violet-50/70 rounded-xl border border-violet-100 flex items-start gap-2 text-violet-800 text-xs">
-                                <Lightbulb className="h-4 w-4 shrink-0 mt-0.5" />
-                                <span>Using simpler explanation mode with analogy to aid understanding.</span>
-                              </div>
-                              
-                              <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Analogy & Simplified Version</p>
-                              <p>{currentConcept.simple_explanation}</p>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Launch practice session */}
-                      <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end">
-                        <button
-                          onClick={() => startPractice(currentConcept)}
-                          className="px-6 py-2.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer transition-colors flex items-center gap-2"
-                        >
-                          <Brain className="h-4 w-4" /> Practice this Concept
-                        </button>
-                      </div>
+              <div className="space-y-6">
+                {/* Full Material Assessment Action Banner */}
+                <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
+                  <div className="flex items-center gap-3.5">
+                    <div className="w-11 h-11 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shrink-0 shadow-2xs">
+                      <Award className="h-6 w-6" />
+                    </div>
+                    <div>
+                      <h4 className="font-bold text-slate-900 text-sm">Full Material Assessment Ready</h4>
+                      <p className="text-xs text-slate-500 mt-0.5">Test yourself across all questions generated from your study materials for "{currentSubject.name}".</p>
                     </div>
                   </div>
-                )}
+                  <button
+                    onClick={() => startMaterialAssessment(currentSubject)}
+                    className="w-full sm:w-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm cursor-pointer transition-all hover:-translate-y-0.5 active:scale-95 flex items-center justify-center gap-2 shrink-0"
+                  >
+                    <Award className="h-4 w-4" /> Start Full Assessment
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                  {/* Concepts list panel */}
+                  <div className="lg:col-span-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Concepts Extracted ({concepts.length})</h3>
+                      <span className="text-[10px] text-slate-400">Click to study</span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {concepts.map(con => {
+                        const m = masteries.find(ma => ma.concept_id === con.id)
+                        const decayedScore = m ? getDecayedMastery(m.score, m.last_updated) : 50
+                        const isSelected = currentConcept?.id === con.id
+                        return (
+                          <div
+                            key={con.id}
+                            onClick={() => {
+                              setCurrentConcept(con)
+                              setExplainSimpler(false)
+                            }}
+                            className={`group w-full text-left p-4 rounded-xl border shadow-sm transition-all flex flex-col justify-between cursor-pointer hover:-translate-y-0.5 ${
+                              isSelected
+                                ? 'border-indigo-600 bg-indigo-50/60 ring-2 ring-indigo-500/20'
+                                : 'border-slate-200 bg-white hover:bg-slate-50'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <span className="font-bold text-slate-900 truncate block text-sm">{con.name}</span>
+                              <button
+                                onClick={(e) => handleDeleteConcept(con.id, con.name, e)}
+                                className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-600 hover:bg-rose-50 p-1 rounded transition-all cursor-pointer"
+                                title="Delete concept"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                            
+                            <div className="flex items-center gap-2 mt-3 w-full">
+                              <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                <div 
+                                  className={`h-1.5 rounded-full ${
+                                    decayedScore >= 70 ? 'bg-emerald-500' : decayedScore >= 40 ? 'bg-amber-500' : 'bg-rose-500'
+                                  }`}
+                                  style={{ width: `${decayedScore}%` }}
+                                ></div>
+                              </div>
+                              <span className="text-[10px] font-bold text-slate-500 shrink-0">{decayedScore}%</span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Concept Study details card */}
+                  {currentConcept && (
+                    <div className="lg:col-span-8 space-y-6">
+                      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col justify-between min-h-[300px]">
+                        <div>
+                          {/* Tab header */}
+                          <div className="flex justify-between items-center pb-4 border-b border-slate-100 mb-6">
+                            <h3 className="text-xl font-bold text-slate-900">{currentConcept.name}</h3>
+                            
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-bold text-slate-500">Explain Simpler:</span>
+                              <button
+                                onClick={() => setExplainSimpler(!explainSimpler)}
+                                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                  explainSimpler ? 'bg-indigo-600' : 'bg-slate-200'
+                                }`}
+                              >
+                                <span
+                                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                    explainSimpler ? 'translate-x-5' : 'translate-x-0'
+                                  }`}
+                                />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Explanation Content */}
+                          <div className="space-y-6 font-medium text-slate-700 leading-relaxed text-sm">
+                            {!explainSimpler ? (
+                              <div className="space-y-4">
+                                <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Concept Summary</p>
+                                <p>{currentConcept.summary}</p>
+                              </div>
+                            ) : (
+                              <div className="space-y-4 animate-fadeIn">
+                                <div className="p-3 bg-indigo-50/70 rounded-xl border border-indigo-100 flex items-start gap-2 text-indigo-900 text-xs">
+                                  <Lightbulb className="h-4 w-4 shrink-0 mt-0.5 text-indigo-600" />
+                                  <span>Using simpler explanation mode with analogy to aid understanding.</span>
+                                </div>
+                                
+                                <p className="font-bold text-xs uppercase text-slate-400 tracking-wider">Analogy & Simplified Version</p>
+                                <p>{currentConcept.simple_explanation}</p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Launch practice session */}
+                        <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end">
+                          <button
+                            onClick={() => startPractice(currentConcept)}
+                            className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm cursor-pointer transition-all hover:-translate-y-0.5 flex items-center gap-2"
+                          >
+                            <Brain className="h-4 w-4" /> Practice this Concept
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -1928,7 +2335,7 @@ export default function App() {
                 <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">Upload learning notes or pick a learning topic above to extract concepts and start active recall practice.</p>
                 <button
                   onClick={() => setIsAddingMaterial(true)}
-                  className="mt-6 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl shadow-md transition-colors cursor-pointer"
+                  className="mt-6 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm transition-colors cursor-pointer hover:-translate-y-0.5"
                 >
                   Add Learning Material Now
                 </button>
@@ -2320,7 +2727,7 @@ export default function App() {
                   <button
                     type="submit"
                     disabled={isCreatingTest}
-                    className="w-full py-2.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-500/10 cursor-pointer disabled:opacity-50 transition-all"
+                    className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer disabled:opacity-50 transition-all hover:-translate-y-0.5"
                   >
                     {isCreatingTest ? 'Creating Test...' : 'Create Test & Generate Code'}
                   </button>
@@ -2551,7 +2958,7 @@ export default function App() {
                 <div className="pt-2 flex gap-3">
                   <button
                     type="submit"
-                    className="flex-1 py-2.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-500/10 cursor-pointer transition-all"
+                    className="flex-1 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer transition-all hover:-translate-y-0.5"
                   >
                     Save Changes
                   </button>

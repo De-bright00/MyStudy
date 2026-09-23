@@ -1,19 +1,49 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { getConfig } from './config'
 
-// Helper to get Gemini client
-function getGeminiModel() {
+// Priority list of Gemini models to support modern endpoints
+const PREFERRED_MODELS = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5-flash']
+
+// Helper to get Gemini client with working model fallback
+export function getGeminiModel(customModelName?: string) {
   const { geminiApiKey } = getConfig()
   if (!geminiApiKey) {
     throw new Error('Gemini API Key is not configured. Please set it in your settings or .env.local file.')
   }
   const genAI = new GoogleGenerativeAI(geminiApiKey)
   return genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
+    model: customModelName || 'gemini-3.6-flash',
     generationConfig: {
       responseMimeType: 'application/json',
     },
   })
+}
+
+// Clean markdown code blocks from JSON output
+export function cleanJsonResponse(text: string): any {
+  let cleaned = text.trim()
+  if (cleaned.startsWith('```json')) {
+    cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '')
+  } else if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '')
+  }
+  return JSON.parse(cleaned)
+}
+
+// Helper to run content generation with fallback models
+async function generateWithFallback(prompt: string): Promise<string> {
+  let lastError: any = null
+  for (const modelName of PREFERRED_MODELS) {
+    try {
+      const model = getGeminiModel(modelName)
+      const result = await model.generateContent(prompt)
+      return result.response.text()
+    } catch (err: any) {
+      console.warn(`Model ${modelName} failed, trying next:`, err?.message || err)
+      lastError = err
+    }
+  }
+  throw lastError || new Error('All Gemini model candidates failed.')
 }
 
 // 1. Guided-Help Guardrail: Detects if input is an assignment/exam task rather than study material
@@ -24,7 +54,6 @@ export interface GuardrailResult {
 
 export async function checkGuidedHelpGuardrail(input: string): Promise<GuardrailResult> {
   try {
-    const model = getGeminiModel()
     const prompt = `
       Analyze the following student input. Determine if it represents a direct homework assignment, essay task, test question, or prompt they want completed (where they would want a finished answer, essay, or solution written for them), rather than study notes, textbook text, or general concepts they want to learn/understand.
 
@@ -39,13 +68,12 @@ export async function checkGuidedHelpGuardrail(input: string): Promise<Guardrail
 
       Student input: "${input.replace(/"/g, '\\"')}"
     `
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
-    return JSON.parse(text) as GuardrailResult
+    const text = await generateWithFallback(prompt)
+    return cleanJsonResponse(text) as GuardrailResult
   } catch (error) {
     console.error('Error in checkGuidedHelpGuardrail:', error)
     // Fallback detection (simple keywords)
-    const keywords = ['solve this', 'write an essay', 'assignment', 'homework', 'test prompt', 'exam question', 'answer this for me']
+    const keywords = ['solve this for me', 'do my homework', 'write an essay for me', 'give me the full answer to this exam']
     const isAssignment = keywords.some(k => input.toLowerCase().includes(k))
     if (isAssignment) {
       return {
@@ -66,78 +94,176 @@ export interface ExtractedConcept {
 
 export async function extractConcepts(rawText: string): Promise<ExtractedConcept[]> {
   try {
-    const model = getGeminiModel()
     const prompt = `
-      You are helping a student study. Given the following material, extract 3-8 distinct concepts covered. For each concept, give:
-      - a short name (1-4 words)
-      - a concise summary (3-5 sentences, factually accurate, no invented details)
-      - a simplified explanation using everyday language and exactly one clear analogy.
-
-      Return structured JSON matching this array structure:
-      [
-        {
-          "name": "Concept Name",
-          "summary": "Concise summary sentences...",
-          "simple_explanation": "Simplified explanation with analogy..."
-        }
-      ]
-
-      Material: ${rawText}
-    `
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
-    return JSON.parse(text) as ExtractedConcept[]
-  } catch (error) {
-    console.error('Error in extractConcepts:', error)
-    // Fallback mock concepts
-    return [
-      {
-        name: "Active Recall",
-        summary: "Active recall involves retrieving information from memory rather than passively rereading it. By forcing the brain to retrieve a concept, you strengthen neural pathways. This technique makes learning more durable over time. It is one of the most effective study strategies known.",
-        simple_explanation: "Instead of just looking at your notes, you hide them and try to explain the concept from memory. It's like testing your muscles by lifting weights rather than just watching someone else lift them."
-      },
-      {
-        name: "Spaced Repetition",
-        summary: "Spaced repetition is a learning technique where reviews are systematicially spaced out over increasing intervals. It exploits the psychological forgetting curve. Reviewing a concept just as you are about to forget it optimizes memory consolidation. This prevents cramming and builds long-term recall.",
-        simple_explanation: "Reviewing information at increasing intervals (e.g., 1 day, 3 days, 1 week) to push it into long-term memory. It is like watering a plant: watering it a little bit regularly is much healthier than dumping a bucket of water on it once a month."
-      },
-      {
-        name: "Feynman Technique",
-        summary: "The Feynman Technique is a learning method that involves explaining a concept in simple terms, as if to a child. By doing this, you quickly identify gaps in your own understanding. You then return to the source material to fill those gaps. Finally, you simplify your explanation further using analogies.",
-        simple_explanation: "Teaching a topic to someone else (or an imaginary child) in simple terms to find what you don't know. It's like trying to draw a map of your neighborhood from memory; you'll quickly realize which streets you don't actually know."
-      }
-    ]
-  }
-}
-
-// 3. Question Generation
-export interface GeneratedQuestion {
-  type: 'mcq' | 'short_answer' | 'flashcard'
-  prompt: string
-  options: string[] | null
-  correct_answer: string
-  difficulty: number
-}
-
-export async function generateQuestions(conceptName: string, summary: string): Promise<GeneratedQuestion[]> {
-  try {
-    const model = getGeminiModel()
-    const prompt = `
-      Generate 5 practice questions for the concept "${conceptName}" based on this summary:
-      "${summary}"
-
-      Include a mix of:
-      - multiple-choice questions (type: "mcq") - provide 4 options in the options array.
-      - short-answer questions (type: "short_answer") - options should be null.
-      - flashcards (type: "flashcard") - options should be null, correct_answer should be the brief explanation on the back of the card.
-
-      Tag each question with a difficulty from 1 (basic recall) to 5 (applied/analytical).
-      Only use facts present in the summary — do not introduce outside information.
+      You are an expert tutor helping a student study and master this specific material.
+      Given the following source material, extract 3-8 distinct, non-overlapping key concepts covered.
+      
+      CRITICAL RULES:
+      - Concepts MUST be derived directly from the provided material. Do not introduce concepts outside this text.
+      - For each concept, provide:
+        - a short name (1-4 words)
+        - a concise summary (3-5 sentences, factually accurate, strictly based on the material)
+        - a simplified explanation using everyday language and exactly one clear analogy.
 
       Return structured JSON:
       [
         {
-          "type": "mcq" | "short_answer" | "flashcard",
+          "name": "Concept Name",
+          "summary": "Concise factual summary based strictly on the material...",
+          "simple_explanation": "Simplified explanation with analogy..."
+        }
+      ]
+
+      Source Material:
+      ${rawText.slice(0, 20000)}
+    `
+    const text = await generateWithFallback(prompt)
+    const parsed = cleanJsonResponse(text) as ExtractedConcept[]
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed
+    }
+    throw new Error('No concepts extracted in expected format')
+  } catch (error: any) {
+    console.error('Error in extractConcepts:', error)
+    throw new Error(`AI concept extraction failed: ${error.message || 'Please check your Gemini API key or connection'}.`)
+  }
+}
+
+// 3. Question Generation
+export type QuestionSettingType = 'objective' | 'theory' | 'body' | 'mixed'
+
+export interface GeneratedQuestion {
+  type: 'mcq' | 'short_answer' | 'flashcard'
+  sub_type?: 'objective' | 'theory' | 'body'
+  prompt: string
+  options: string[] | null
+  correct_answer: string
+  difficulty: number
+  concept_name?: string
+  rubric?: string
+}
+
+export async function generateQuestionsFromMaterial(
+  materialTitle: string,
+  materialText: string,
+  count: number = 5,
+  questionType: QuestionSettingType = 'mixed',
+  concepts: ExtractedConcept[] = []
+): Promise<GeneratedQuestion[]> {
+  try {
+    const conceptNames = concepts.map(c => c.name).join(', ')
+    
+    let typeInstructions = ''
+    if (questionType === 'objective') {
+      typeInstructions = `
+        Generate EXACTLY ${count} MULTIPLE-CHOICE (Objective) questions.
+        - "type": "mcq"
+        - "sub_type": "objective"
+        - "options": Array of exactly 4 plausible options [Option A, Option B, Option C, Option D].
+        - "correct_answer": Exactly matches one of the options.
+        - Randomize which index contains the correct answer so it is not predictable.
+      `
+    } else if (questionType === 'theory') {
+      typeInstructions = `
+        Generate EXACTLY ${count} THEORY (Short-Answer / Conceptual) questions.
+        - "type": "short_answer"
+        - "sub_type": "theory"
+        - "options": null
+        - "prompt": Questions that test comprehension of principles, definitions, cause-and-effect, and mechanisms.
+        - "correct_answer": A concise 2-3 sentence benchmark explanation based on the material.
+        - "rubric": 2-3 essential conceptual points a student must demonstrate to be credited.
+      `
+    } else if (questionType === 'body') {
+      typeInstructions = `
+        Generate EXACTLY ${count} BODY (In-Depth / Essay / Analytical) questions.
+        - "type": "short_answer"
+        - "sub_type": "body"
+        - "options": null
+        - "prompt": Questions requiring the student to elaborate, analyze, compare, or explain structured processes in depth based on the material.
+        - "correct_answer": A comprehensive benchmark answer (1-2 paragraphs).
+        - "rubric": Key criteria, structural points, and core arguments expected.
+      `
+    } else {
+      // Mixed
+      typeInstructions = `
+        Generate a balanced MIX of EXACTLY ${count} questions:
+        - Approximately 50-60% Objective multiple choice ("type": "mcq", "sub_type": "objective", "options": [4 choices])
+        - Approximately 25-30% Theory conceptual ("type": "short_answer", "sub_type": "theory", "options": null)
+        - Approximately 15-20% Body in-depth analytical ("type": "short_answer", "sub_type": "body", "options": null)
+      `
+    }
+
+    const prompt = `
+      You are an expert assessment examiner creating an official test and practice questions for students based on their study material titled "${materialTitle}".
+
+      ${typeInstructions}
+
+      CRITICAL ASSESSMENT RULES:
+      1. STRICTLY GROUNDED IN MATERIAL: Every single question and answer MUST be directly verifiable from the provided source text. Do NOT make up outside facts.
+      2. RANDOMIZED & VARIED: Ensure questions test diverse parts of the text, not just the first paragraph.
+      3. Tag each question with a difficulty from 1 (fundamental recall) to 5 (applied analysis).
+      4. If applicable, attribute each question to one of the extracted concepts: ${conceptNames || 'the material'}.
+
+      Source Material:
+      ${materialText.slice(0, 22000)}
+
+      Return structured JSON array of exactly ${count} question objects:
+      [
+        {
+          "type": "mcq" | "short_answer",
+          "sub_type": "objective" | "theory" | "body",
+          "prompt": "Question text...",
+          "options": ["Option A", "Option B", "Option C", "Option D"] or null,
+          "correct_answer": "Benchmark correct answer text",
+          "difficulty": 1-5,
+          "concept_name": "Concept Name",
+          "rubric": "Optional key points expected"
+        }
+      ]
+    `
+
+    const text = await generateWithFallback(prompt)
+    const questions = cleanJsonResponse(text) as GeneratedQuestion[]
+    
+    if (Array.isArray(questions) && questions.length > 0) {
+      // Validate structure
+      return questions.map(q => ({
+        type: q.type === 'mcq' ? 'mcq' : 'short_answer',
+        sub_type: q.sub_type || (q.type === 'mcq' ? 'objective' : 'theory'),
+        prompt: q.prompt,
+        options: Array.isArray(q.options) && q.options.length >= 2 ? q.options : null,
+        correct_answer: q.correct_answer,
+        difficulty: Math.max(1, Math.min(5, q.difficulty || 2)),
+        concept_name: q.concept_name,
+        rubric: q.rubric
+      }))
+    }
+    throw new Error('Failed to parse questions array')
+  } catch (error: any) {
+    console.error('Error in generateQuestionsFromMaterial:', error)
+    throw new Error(`AI question generation failed: ${error.message || 'Please check your Gemini connection'}.`)
+  }
+}
+
+// Fallback for single concept questions
+export async function generateQuestions(conceptName: string, summary: string): Promise<GeneratedQuestion[]> {
+  try {
+    const prompt = `
+      Generate 5 practice questions for the concept "${conceptName}" strictly based on this summary:
+      "${summary}"
+
+      Include a mix of:
+      - multiple-choice questions (type: "mcq", sub_type: "objective") with 4 plausible options.
+      - conceptual short-answer theory questions (type: "short_answer", sub_type: "theory", options: null).
+
+      Tag each question with a difficulty from 1 (basic recall) to 5 (applied/analytical).
+      Only use facts present in the summary.
+
+      Return structured JSON:
+      [
+        {
+          "type": "mcq" | "short_answer",
+          "sub_type": "objective" | "theory",
           "prompt": "Question text...",
           "options": ["Option A", "Option B", "Option C", "Option D"] or null,
           "correct_answer": "Correct answer text",
@@ -145,107 +271,117 @@ export async function generateQuestions(conceptName: string, summary: string): P
         }
       ]
     `
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
-    return JSON.parse(text) as GeneratedQuestion[]
+    const text = await generateWithFallback(prompt)
+    const parsed = cleanJsonResponse(text) as GeneratedQuestion[]
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed
+    }
+    throw new Error('Invalid format returned')
   } catch (error) {
-    console.error('Error in generateQuestions:', error)
-    // Fallback mock questions
+    console.error('Error in generateQuestions fallback:', error)
+    // Intelligent local fallback if offline
     return [
       {
         type: 'mcq',
-        prompt: `Which of the following is the main benefit of active recall?`,
+        sub_type: 'objective',
+        prompt: `According to the concept "${conceptName}", which statement is most accurate?`,
         options: [
-          'It allows you to read faster.',
-          'It strengthens neural pathways by retrieving information.',
-          'It requires less mental effort than rereading.',
-          'It helps you memorize essays word-for-word.'
+          `It is a foundational study principle in this subject.`,
+          `It is unrelated to learning or memory retention.`,
+          `It only applies to passive reading without practice.`,
+          `It has no measurable effect on understanding.`
         ],
-        correct_answer: 'It strengthens neural pathways by retrieving information.',
-        difficulty: 1
+        correct_answer: `It is a foundational study principle in this subject.`,
+        difficulty: 1,
+        concept_name: conceptName
       },
       {
         type: 'short_answer',
-        prompt: `How does active recall differ from passive rereading?`,
+        sub_type: 'theory',
+        prompt: `Explain the core purpose of "${conceptName}" based on your study material.`,
         options: null,
-        correct_answer: 'Active recall retrieves info from memory; passive reading just reviews it on the page.',
-        difficulty: 3
-      },
-      {
-        type: 'flashcard',
-        prompt: `Active Recall`,
-        options: null,
-        correct_answer: 'Retrieving info from memory to strengthen neural pathways.',
-        difficulty: 1
-      },
-      {
-        type: 'mcq',
-        prompt: `When practicing active recall, what does the retrieval process do to the brain?`,
-        options: [
-          'It temporarily fatigues it.',
-          'It strengthens neural pathways.',
-          'It has no long term effect.',
-          'It decreases short term memory.'
-        ],
-        correct_answer: 'It strengthens neural pathways.',
-        difficulty: 2
-      },
-      {
-        type: 'short_answer',
-        prompt: `Why is active recall considered a durable learning method?`,
-        options: null,
-        correct_answer: 'Because retrieving information forces the brain to construct and solidify memory pathways.',
-        difficulty: 4
+        correct_answer: summary,
+        difficulty: 2,
+        concept_name: conceptName
       }
     ]
   }
 }
 
-// 4. Answer Feedback (Socratic / guided for incorrect answers)
+// 4. Answer Feedback (Intelligent conceptual evaluation rewarding student's own understanding)
 export interface AnswerFeedback {
   is_correct: boolean
+  score_percentage: number
   feedback: string
+  strengths?: string
+  missing_points?: string
 }
 
 export async function evaluateAnswer(
   questionPrompt: string,
   correctAnswer: string,
-  studentAnswer: string
+  studentAnswer: string,
+  questionType: string = 'short_answer',
+  sourceMaterialContext?: string
 ): Promise<AnswerFeedback> {
   try {
-    const model = getGeminiModel()
     const prompt = `
-      The student was asked: "${questionPrompt}"
-      Correct answer: "${correctAnswer}"
-      Student answered: "${studentAnswer}"
+      You are an expert, compassionate assessment evaluator on an educational testing platform.
+      Question asked: "${questionPrompt.replace(/"/g, '\\"')}"
+      Question Type: "${questionType}"
+      Benchmark / Reference Answer: "${correctAnswer.replace(/"/g, '\\"')}"
+      ${sourceMaterialContext ? `Relevant Source Context: "${sourceMaterialContext.slice(0, 1000).replace(/"/g, '\\"')}"` : ''}
+      Student's Submitted Answer: "${studentAnswer.replace(/"/g, '\\"')}"
 
-      Determine if this is correct (allow for reasonable phrasing variation on short answers).
-      Then give feedback:
-      - If correct: briefly confirm and reinforce why.
-      - If incorrect: explain specifically what was misunderstood and point back to the concept — DO NOT just restate the correct answer, help them see why theirs was wrong. Do not give the completed answer directly; guide them towards understanding.
-
-      Keep the feedback under 80 words.
+      EVALUATION RULES:
+      1. GIVE ROOM FOR THE STUDENT'S OWN UNDERSTANDING:
+         - Do NOT penalize the student for not copying and pasting verbatim text from the notes.
+         - Reward students who explain the concept correctly in their own words, using their own phrasing, terms, or valid everyday analogies.
+         - If the student shows that they understand the underlying mechanism, definition, principle, or reasoning accurately, mark "is_correct": true.
+      2. For multiple-choice (objective):
+         - Exact match of the option text or correct letter = 100% and is_correct: true.
+      3. For theory and body questions:
+         - Grade conceptually based on genuine understanding.
+         - Award a "score_percentage" from 0 to 100.
+         - If score_percentage >= 50, mark "is_correct": true.
+      4. Constructive Feedback:
+         - Start by acknowledging what they understood well in their own words.
+         - Gently clarify any misconceptions or important nuances they missed from the material.
+         - Keep feedback under 90 words.
 
       Return JSON format:
       {
         "is_correct": boolean,
-        "feedback": "Feedback text..."
+        "score_percentage": number (0 to 100),
+        "feedback": "Concise, constructive feedback...",
+        "strengths": "What the student grasped well in their own words",
+        "missing_points": "Any key nuances or details to refine"
       }
     `
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
-    return JSON.parse(text) as AnswerFeedback
+    const text = await generateWithFallback(prompt)
+    const result = cleanJsonResponse(text) as AnswerFeedback
+    return {
+      is_correct: Boolean(result.is_correct),
+      score_percentage: typeof result.score_percentage === 'number' ? result.score_percentage : (result.is_correct ? 100 : 30),
+      feedback: result.feedback || (result.is_correct ? 'Great job! You demonstrated clear understanding in your own words.' : 'Not quite. Check the key concepts from your material.'),
+      strengths: result.strengths,
+      missing_points: result.missing_points
+    }
   } catch (error) {
     console.error('Error in evaluateAnswer:', error)
-    // Fallback evaluation
-    const isCorrect = studentAnswer.toLowerCase().trim() === correctAnswer.toLowerCase().trim() ||
-      correctAnswer.toLowerCase().includes(studentAnswer.toLowerCase()) && studentAnswer.length > 3
+    // Intelligent local fallback evaluation
+    const cleanedStudent = studentAnswer.toLowerCase().trim()
+    const cleanedCorrect = correctAnswer.toLowerCase().trim()
+    const isExact = cleanedStudent === cleanedCorrect
+    const isSubstring = cleanedCorrect.includes(cleanedStudent) && cleanedStudent.length > 5
+    const isCorrect = isExact || isSubstring
     
     return {
       is_correct: isCorrect,
+      score_percentage: isCorrect ? 100 : 35,
       feedback: isCorrect
-        ? "Excellent job! You correctly identified the core element of the concept."
-        : "Not quite. Think about the distinction between active retrieval and passive reading. Can you identify how forcing memory retrieval strengthens learning?"
+        ? "Good job! You captured the essential idea of this question."
+        : "Your answer differs from the material benchmark. Review the key concept points to solidify your understanding."
     }
   }
 }
@@ -257,7 +393,6 @@ export async function generateStudyPlanReason(
   isWeakest: boolean
 ): Promise<string> {
   try {
-    const model = getGeminiModel()
     const prompt = `
       Generate a brief, one-line, encouraging study motivation reason for a concept named "${conceptName}".
       The student's mastery score is ${masteryScore.toFixed(0)}%.
@@ -268,9 +403,8 @@ export async function generateStudyPlanReason(
         "reason": "One-line motivation..."
       }
     `
-    const result = await model.generateContent(prompt)
-    const text = result.response.text()
-    const parsed = JSON.parse(text) as { reason: string }
+    const text = await generateWithFallback(prompt)
+    const parsed = cleanJsonResponse(text) as { reason: string }
     return parsed.reason
   } catch (error) {
     console.error('Error in generateStudyPlanReason:', error)
