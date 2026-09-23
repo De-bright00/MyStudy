@@ -8,7 +8,7 @@ const PREFERRED_MODELS = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5
 export function getGeminiModel(customModelName?: string) {
   const { geminiApiKey } = getConfig()
   if (!geminiApiKey) {
-    throw new Error('Gemini API Key is not configured. Please set it in your settings or .env.local file.')
+    throw new Error('AI API Key is not configured. Please set it in your settings or .env.local file.')
   }
   const genAI = new GoogleGenerativeAI(geminiApiKey)
   return genAI.getGenerativeModel({
@@ -19,19 +19,77 @@ export function getGeminiModel(customModelName?: string) {
   })
 }
 
-// Clean markdown code blocks from JSON output
+// Clean markdown code blocks from JSON output and unwrap objects if needed
 export function cleanJsonResponse(text: string): any {
   let cleaned = text.trim()
-  if (cleaned.startsWith('```json')) {
-    cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '')
-  } else if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '')
+  const jsonBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
+  if (jsonBlockMatch) {
+    cleaned = jsonBlockMatch[1].trim()
+  } else {
+    const firstBracket = cleaned.search(/[{\[]/)
+    const lastBracket = Math.max(cleaned.lastIndexOf('}'), cleaned.lastIndexOf(']'))
+    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+      cleaned = cleaned.slice(firstBracket, lastBracket + 1)
+    }
   }
-  return JSON.parse(cleaned)
+
+  const parsed = JSON.parse(cleaned)
+  if (!Array.isArray(parsed) && typeof parsed === 'object' && parsed !== null) {
+    if (Array.isArray(parsed.concepts)) return parsed.concepts
+    if (Array.isArray(parsed.questions)) return parsed.questions
+    if (Array.isArray(parsed.data)) return parsed.data
+    if (Array.isArray(parsed.items)) return parsed.items
+    if (Array.isArray(parsed.results)) return parsed.results
+  }
+  return parsed
 }
 
-// Helper to run content generation with fallback models
+// Helper to run content generation with fallback models or OpenAI
 async function generateWithFallback(prompt: string): Promise<string> {
+  const { geminiApiKey } = getConfig()
+  if (!geminiApiKey) {
+    throw new Error('AI API Key is not configured. Please set it in your .env.local file.')
+  }
+
+  // If using an OpenAI API Key (starts with sk-)
+  if (geminiApiKey.startsWith('sk-')) {
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${geminiApiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert educational AI assistant for Mystudy assessment platform. Respond strictly in valid JSON format. If returning a list of concepts or questions, you can return a JSON object with a "concepts" or "questions" array.'
+            },
+            {
+              role: 'user',
+              content: prompt
+            }
+          ],
+          response_format: { type: 'json_object' }
+        })
+      })
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData?.error?.message || `OpenAI request failed with status ${response.status}`)
+      }
+
+      const data = await response.json()
+      return data.choices?.[0]?.message?.content || ''
+    } catch (err: any) {
+      console.error('OpenAI generation error:', err?.message || 'Request failed')
+      throw new Error(err?.message || 'AI request failed')
+    }
+  }
+
+  // If using a Gemini API Key
   let lastError: any = null
   for (const modelName of PREFERRED_MODELS) {
     try {
