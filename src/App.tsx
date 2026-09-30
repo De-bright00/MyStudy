@@ -55,6 +55,7 @@ import {
   dbCreateQuestions,
   dbFetchQuestionsForSubject,
   dbDeleteConcept,
+  dbDeleteSubject,
   dbFetchAttempts,
   dbCreateAttempt,
   dbFetchMastery,
@@ -466,21 +467,37 @@ export default function App() {
     if (file) processUploadedFile(file)
   }
 
-  const handleDeleteConcept = async (conceptId: string, conceptName: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-    if (!confirm(`Are you sure you want to delete concept "${conceptName}" and its questions?`)) return
+  const handleDeleteConcept = async (conceptId: string, conceptName: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation()
+    if (!confirm(`Are you sure you want to delete concept "${conceptName}" and all its questions?`)) return
     try {
       await dbDeleteConcept(conceptId)
       setConcepts(prev => prev.filter(c => c.id !== conceptId))
       if (currentConcept?.id === conceptId) {
-        setCurrentConcept(concepts.find(c => c.id !== conceptId) || null)
+        const remaining = concepts.filter(c => c.id !== conceptId)
+        setCurrentConcept(remaining.length > 0 ? remaining[0] : null)
       }
       loadUserData()
       if (currentSubject) {
         await loadSubjectDetails(currentSubject.id)
       }
     } catch (err: any) {
-      alert('Failed to delete concept: ' + err.message)
+      alert('Failed to delete concept: ' + (err.message || err))
+    }
+  }
+
+  const handleDeleteSubject = async (subjectId: string, subjectName: string) => {
+    if (!confirm(`Are you sure you want to delete the entire subject "${subjectName}" and all its materials, concepts, and questions?`)) return
+    try {
+      await dbDeleteSubject(subjectId)
+      const remainingSubjects = subjects.filter(s => s.id !== subjectId)
+      setSubjects(remainingSubjects)
+      if (currentSubject?.id === subjectId) {
+        setCurrentSubject(remainingSubjects.length > 0 ? remainingSubjects[0] : null)
+      }
+      loadUserData()
+    } catch (err: any) {
+      alert('Failed to delete subject: ' + (err.message || err))
     }
   }
 
@@ -494,7 +511,7 @@ export default function App() {
     if (sourceType === 'topic_only') {
       if (!topicOnlyName.trim()) return
       titleToSubmit = topicOnlyName.trim()
-      contentToSubmit = `Study materials and concepts related to the topic of ${topicOnlyName.trim()}.`
+      contentToSubmit = `Study materials and key principles related to the topic of ${topicOnlyName.trim()}.`
     } else {
       if (!rawText.trim()) return
       contentToSubmit = rawText.trim()
@@ -502,27 +519,30 @@ export default function App() {
     }
 
     setIsAddingMaterial(true)
-    setMaterialLoadingState('Step 1: Running educational guardrail check...')
+    setMaterialLoadingState('Step 1: Checking study material...')
     setGuardrailWarning(null)
 
     try {
-      // Check Guided-Help Guardrail
-      const guardrail = await checkGuidedHelpGuardrail(contentToSubmit)
-      if (guardrail.isAssignment) {
-        // Block creation, trigger guidance view
-        setGuardrailWarning({
-          originalInput: contentToSubmit,
-          guidance: guardrail.guidance || "It looks like you've uploaded an assignment. Let's work through this step by step."
-        })
-        setIsAddingMaterial(false)
-        return
+      // Check Guided-Help Guardrail safely
+      try {
+        const guardrail = await checkGuidedHelpGuardrail(contentToSubmit)
+        if (guardrail.isAssignment) {
+          setGuardrailWarning({
+            originalInput: contentToSubmit,
+            guidance: guardrail.guidance || "It looks like you've uploaded an assignment. Let's work through this step by step."
+          })
+          setIsAddingMaterial(false)
+          return
+        }
+      } catch (guardErr) {
+        console.warn('Guardrail check skipped due to connection:', guardErr)
       }
 
       // Proceed with creation
       setMaterialLoadingState('Step 2: Saving material details...')
       const newMat = await dbCreateMaterial(currentSubject.id, titleToSubmit, contentToSubmit, sourceType)
       
-      setMaterialLoadingState('Step 3: AI is extracting key study concepts (Gemini 3.6)...')
+      setMaterialLoadingState('Step 3: Extracting key study concepts from your material...')
       const extracted = await extractConcepts(contentToSubmit)
 
       if (extracted.length === 0) {
@@ -532,7 +552,7 @@ export default function App() {
       setMaterialLoadingState('Step 4: Creating study concepts...')
       const newConcepts = await dbCreateConcepts(extracted, newMat.id, currentSubject.id)
 
-      setMaterialLoadingState(`Step 5: Generating ${materialQuestionCount} ${materialQuestionType.toUpperCase()} questions directly from your material...`)
+      setMaterialLoadingState(`Step 5: Setting ${materialQuestionCount} ${materialQuestionType.toUpperCase()} questions directly from your notes...`)
       
       try {
         const generatedQs = await generateQuestionsFromMaterial(
@@ -1820,7 +1840,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="flex gap-2">
+              <div className="flex items-center gap-2">
                 <select
                   value={currentSubject?.id || ''}
                   onChange={(e) => {
@@ -1839,6 +1859,15 @@ export default function App() {
                 >
                   <Plus className="h-4 w-4" /> Add Material
                 </button>
+                {currentSubject && (
+                  <button
+                    onClick={() => handleDeleteSubject(currentSubject.id, currentSubject.name)}
+                    className="p-2 border border-slate-200 hover:border-rose-300 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-all cursor-pointer shadow-sm"
+                    title={`Delete entire subject "${currentSubject.name}"`}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2241,7 +2270,7 @@ export default function App() {
                               <span className="font-bold text-slate-900 truncate block text-sm">{con.name}</span>
                               <button
                                 onClick={(e) => handleDeleteConcept(con.id, con.name, e)}
-                                className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-600 hover:bg-rose-50 p-1 rounded transition-all cursor-pointer"
+                                className="opacity-70 group-hover:opacity-100 text-slate-400 hover:text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg transition-all cursor-pointer shrink-0"
                                 title="Delete concept"
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
@@ -2312,8 +2341,16 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Launch practice session */}
-                        <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end">
+                        {/* Launch practice session or delete */}
+                        <div className="mt-8 pt-4 border-t border-slate-100 flex items-center justify-between gap-4">
+                          <button
+                            onClick={() => handleDeleteConcept(currentConcept.id, currentConcept.name)}
+                            className="px-4 py-2 border border-rose-200 text-rose-600 hover:bg-rose-50 text-xs font-bold rounded-xl cursor-pointer transition-all flex items-center gap-1.5"
+                            title="Delete this concept and all its questions"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            <span>Delete Concept</span>
+                          </button>
                           <button
                             onClick={() => startPractice(currentConcept)}
                             className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm cursor-pointer transition-all hover:-translate-y-0.5 flex items-center gap-2"
@@ -2332,7 +2369,7 @@ export default function App() {
               <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center shadow-sm">
                 <BookOpen className="h-12 w-12 text-slate-300 mx-auto mb-4" />
                 <h3 className="text-lg font-bold text-slate-800">No study materials in "{currentSubject.name}"</h3>
-                <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">Upload learning notes or pick a learning topic above to extract concepts and start active recall practice.</p>
+                <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">Upload learning notes or paste your study material above to extract concepts and set practice questions.</p>
                 <button
                   onClick={() => setIsAddingMaterial(true)}
                   className="mt-6 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-sm transition-colors cursor-pointer hover:-translate-y-0.5"

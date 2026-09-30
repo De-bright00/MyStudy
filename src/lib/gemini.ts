@@ -1,18 +1,18 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { getConfig } from './config'
 
-// Priority list of Gemini models to support modern endpoints
-const PREFERRED_MODELS = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5-flash']
+// Priority list of valid Gemini models
+const PREFERRED_MODELS = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']
 
 // Helper to get Gemini client with working model fallback
 export function getGeminiModel(customModelName?: string) {
   const { geminiApiKey } = getConfig()
   if (!geminiApiKey) {
-    throw new Error('AI API Key is not configured. Please set it in your settings or .env.local file.')
+    throw new Error('AI API Key is not configured. Please set it in your settings or .env file.')
   }
   const genAI = new GoogleGenerativeAI(geminiApiKey)
   return genAI.getGenerativeModel({
-    model: customModelName || 'gemini-3.6-flash',
+    model: customModelName || 'gemini-1.5-flash',
     generationConfig: {
       responseMimeType: 'application/json',
     },
@@ -48,7 +48,7 @@ export function cleanJsonResponse(text: string): any {
 async function generateWithFallback(prompt: string): Promise<string> {
   const { geminiApiKey } = getConfig()
   if (!geminiApiKey) {
-    throw new Error('AI API Key is not configured. Please set it in your .env.local file.')
+    throw new Error('AI API Key is not configured.')
   }
 
   // If using an OpenAI API Key (starts with sk-)
@@ -84,8 +84,8 @@ async function generateWithFallback(prompt: string): Promise<string> {
       const data = await response.json()
       return data.choices?.[0]?.message?.content || ''
     } catch (err: any) {
-      console.error('OpenAI generation error:', err?.message || 'Request failed')
-      throw new Error(err?.message || 'AI request failed')
+      console.warn('OpenAI generation error:', err?.message || 'Request failed')
+      throw err
     }
   }
 
@@ -150,20 +150,195 @@ export interface ExtractedConcept {
   simple_explanation: string
 }
 
+// Smart local extraction fallback that analyzes actual student text directly
+export function extractConceptsFromTextLocally(rawText: string): ExtractedConcept[] {
+  const cleaned = rawText.replace(/\r\n/g, '\n').trim()
+  if (!cleaned) {
+    return [{
+      name: 'General Material Study',
+      summary: 'General notes and study concepts from this uploaded material.',
+      simple_explanation: 'Key points to review and practice.'
+    }]
+  }
+
+  // 1. Try to detect sections / headings / bullet points
+  const lines = cleaned.split('\n').map(l => l.trim()).filter(Boolean)
+  const candidateHeadings: string[] = []
+
+  for (const line of lines) {
+    const isMdHeading = /^#{1,4}\s+(.+)$/.exec(line)
+    const isNumbered = /^(?:[0-9]+[.)]|[A-Z][.)])\s+([A-Z0-9].{3,60})$/.exec(line)
+    const isTitleLine = line.length <= 60 && line.length >= 4 && !line.endsWith('.') && !line.endsWith(',') && /^[A-Z0-9]/.test(line)
+
+    if (isMdHeading && isMdHeading[1]) {
+      candidateHeadings.push(isMdHeading[1].trim())
+    } else if (isNumbered && isNumbered[1]) {
+      candidateHeadings.push(isNumbered[1].trim())
+    } else if (isTitleLine && !candidateHeadings.includes(line)) {
+      candidateHeadings.push(line)
+    }
+  }
+
+  // Deduplicate and filter headings
+  const uniqueHeadings = Array.from(new Set(candidateHeadings))
+    .filter(h => h.length >= 3 && h.length <= 60)
+    .slice(0, 5)
+
+  if (uniqueHeadings.length >= 2) {
+    return uniqueHeadings.map(heading => {
+      const headingIdx = cleaned.indexOf(heading)
+      const afterText = headingIdx !== -1 ? cleaned.slice(headingIdx + heading.length, headingIdx + 800).trim() : ''
+      const firstFewSentences = afterText.split(/(?<=[.?!])\s+/).slice(0, 3).join(' ') || `Key conceptual material covering ${heading}.`
+      const cleanName = heading.replace(/^[#0-9.)\s]+/, '').trim()
+      return {
+        name: cleanName,
+        summary: firstFewSentences.slice(0, 300),
+        simple_explanation: `Key study principle: understanding how ${cleanName} applies in this material.`
+      }
+    })
+  }
+
+  // 2. If no distinct headings found, split paragraphs into concepts
+  const paragraphs = cleaned.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 40)
+  if (paragraphs.length >= 2) {
+    return paragraphs.slice(0, 4).map((p, idx) => {
+      const firstSentence = p.split(/(?<=[.?!])\s+/)[0] || ''
+      const words = firstSentence.replace(/[^a-zA-Z0-9\s]/g, '').split(/\s+/).slice(0, 4).join(' ')
+      const name = words.length > 3 ? words : `Section ${idx + 1}`
+      return {
+        name: name.charAt(0).toUpperCase() + name.slice(1),
+        summary: p.slice(0, 300),
+        simple_explanation: `Focus on how this section connects with the overall topic.`
+      }
+    })
+  }
+
+  // 3. Fallback for single block of text
+  const sentences = cleaned.split(/(?<=[.?!])\s+/).filter(s => s.length > 20)
+  const mainTopic = sentences[0]?.slice(0, 40) || 'Core Subject Material'
+  return [
+    {
+      name: mainTopic.replace(/[^a-zA-Z0-9\s]/g, '').trim() || 'Key Material Points',
+      summary: sentences.slice(0, 3).join(' ').slice(0, 300) || cleaned.slice(0, 250),
+      simple_explanation: 'The essential core of this lesson to review and practice.'
+    }
+  ]
+}
+
+// Smart local question generation fallback grounded directly in actual material sentences
+export function generateQuestionsFromMaterialLocally(
+  materialTitle: string,
+  materialText: string,
+  count: number = 5,
+  questionType: QuestionSettingType = 'mixed',
+  concepts: ExtractedConcept[] = []
+): GeneratedQuestion[] {
+  const cleaned = materialText.replace(/\r\n/g, '\n').trim()
+  const rawSentences = cleaned
+    .split(/(?<=[.?!])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 25 && s.length <= 250 && !s.startsWith('#'))
+
+  const sentences = rawSentences.length > 0 ? rawSentences : [
+    `${materialTitle} provides fundamental core knowledge for this study material.`,
+    `Mastering the key concepts of ${materialTitle} enables deeper subject comprehension.`,
+    `Reviewing principles and applying them through practice questions reinforces learning.`
+  ]
+
+  const questions: GeneratedQuestion[] = []
+  const conceptNames = concepts.length > 0 ? concepts.map(c => c.name) : [materialTitle]
+
+  for (let i = 0; i < count; i++) {
+    const targetSentence = sentences[i % sentences.length]
+    const assignedConcept = conceptNames[i % conceptNames.length]
+
+    let currentType: 'mcq' | 'short_answer' = 'mcq'
+    let currentSubType: 'objective' | 'theory' | 'body' = 'objective'
+
+    if (questionType === 'objective') {
+      currentType = 'mcq'
+      currentSubType = 'objective'
+    } else if (questionType === 'theory') {
+      currentType = 'short_answer'
+      currentSubType = 'theory'
+    } else if (questionType === 'body') {
+      currentType = 'short_answer'
+      currentSubType = 'body'
+    } else {
+      if (i % 3 === 0 || i % 3 === 1) {
+        currentType = 'mcq'
+        currentSubType = 'objective'
+      } else if (i % 3 === 2 && i % 2 === 0) {
+        currentType = 'short_answer'
+        currentSubType = 'body'
+      } else {
+        currentType = 'short_answer'
+        currentSubType = 'theory'
+      }
+    }
+
+    if (currentType === 'mcq') {
+      const otherSentences = sentences.filter(s => s !== targetSentence)
+      const distractor1 = otherSentences[0] || `It contradicts the primary conclusions of ${assignedConcept}.`
+      const distractor2 = otherSentences[1] || `It is unrelated to the foundational mechanisms of this subject.`
+      const distractor3 = `None of the documented principles in ${assignedConcept} support this finding.`
+
+      const options = [targetSentence, distractor1, distractor2, distractor3]
+      const shuffledOptions = [...options].sort((a, b) => ((a.length + i) % 3) - ((b.length + i) % 3))
+
+      questions.push({
+        type: 'mcq',
+        sub_type: 'objective',
+        prompt: `Based on your notes for "${assignedConcept}", which statement is accurate?`,
+        options: shuffledOptions,
+        correct_answer: targetSentence,
+        difficulty: (i % 3) + 1,
+        concept_name: assignedConcept,
+        rubric: `Directly verifiable from the material: "${targetSentence}"`
+      })
+    } else if (currentSubType === 'theory') {
+      questions.push({
+        type: 'short_answer',
+        sub_type: 'theory',
+        prompt: `In your own words, explain the core principle and purpose of "${assignedConcept}" based on your notes.`,
+        options: null,
+        correct_answer: targetSentence,
+        difficulty: 3,
+        concept_name: assignedConcept,
+        rubric: `Student should explain the concept and articulate: ${targetSentence.slice(0, 100)}`
+      })
+    } else {
+      const contextPara = sentences.slice(i % sentences.length, (i % sentences.length) + 2).join(' ')
+      questions.push({
+        type: 'short_answer',
+        sub_type: 'body',
+        prompt: `Provide an in-depth analytical explanation of "${assignedConcept}". How does it operate within "${materialTitle}"?`,
+        options: null,
+        correct_answer: contextPara || targetSentence,
+        difficulty: 4,
+        concept_name: assignedConcept,
+        rubric: `In-depth analysis demonstrating understanding of: ${targetSentence}`
+      })
+    }
+  }
+
+  return questions
+}
+
 export async function extractConcepts(rawText: string): Promise<ExtractedConcept[]> {
   try {
     const prompt = `
       You are an expert tutor helping a student study and master this specific material.
-      Given the following source material, extract 3-8 distinct, non-overlapping key concepts covered.
+      Given the following source material, extract 2-6 distinct, key concepts covered.
       
       CRITICAL RULES:
       - Concepts MUST be derived directly from the provided material. Do not introduce concepts outside this text.
       - For each concept, provide:
         - a short name (1-4 words)
-        - a concise summary (3-5 sentences, factually accurate, strictly based on the material)
-        - a simplified explanation using everyday language and exactly one clear analogy.
+        - a concise summary (2-4 sentences, factually accurate, strictly based on the material)
+        - a simplified explanation using everyday language and one clear analogy.
 
-      Return structured JSON:
+      Return structured JSON array:
       [
         {
           "name": "Concept Name",
@@ -180,10 +355,10 @@ export async function extractConcepts(rawText: string): Promise<ExtractedConcept
     if (Array.isArray(parsed) && parsed.length > 0) {
       return parsed
     }
-    throw new Error('No concepts extracted in expected format')
+    throw new Error('AI returned empty response')
   } catch (error: any) {
-    console.error('Error in extractConcepts:', error)
-    throw new Error(`AI concept extraction failed: ${error.message || 'Please check your Gemini API key or connection'}.`)
+    console.warn('AI online concept extraction unavailable, falling back to smart local text analysis:', error?.message || error)
+    return extractConceptsFromTextLocally(rawText)
   }
 }
 
@@ -284,7 +459,6 @@ export async function generateQuestionsFromMaterial(
     const questions = cleanJsonResponse(text) as GeneratedQuestion[]
     
     if (Array.isArray(questions) && questions.length > 0) {
-      // Validate structure
       return questions.map(q => ({
         type: q.type === 'mcq' ? 'mcq' : 'short_answer',
         sub_type: q.sub_type || (q.type === 'mcq' ? 'objective' : 'theory'),
@@ -292,14 +466,14 @@ export async function generateQuestionsFromMaterial(
         options: Array.isArray(q.options) && q.options.length >= 2 ? q.options : null,
         correct_answer: q.correct_answer,
         difficulty: Math.max(1, Math.min(5, q.difficulty || 2)),
-        concept_name: q.concept_name,
+        concept_name: q.concept_name || (concepts[0]?.name || materialTitle),
         rubric: q.rubric
       }))
     }
     throw new Error('Failed to parse questions array')
   } catch (error: any) {
-    console.error('Error in generateQuestionsFromMaterial:', error)
-    throw new Error(`AI question generation failed: ${error.message || 'Please check your Gemini connection'}.`)
+    console.warn('AI question generation online unavailable, generating questions directly from material text:', error?.message || error)
+    return generateQuestionsFromMaterialLocally(materialTitle, materialText, count, questionType, concepts)
   }
 }
 

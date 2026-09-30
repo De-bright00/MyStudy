@@ -176,89 +176,7 @@ const mockDb = {
 
 // Initialize seed subjects/concepts if local storage is empty
 export function seedMockData() {
-  if (mockDb.getSubjects().length === 0) {
-    const defaultSubject: Subject = {
-      id: 'sub-1',
-      user_id: MOCK_USER_ID,
-      name: 'Effective Learning Methods',
-      created_at: new Date().toISOString()
-    }
-    const defaultMaterial: Material = {
-      id: 'mat-1',
-      subject_id: 'sub-1',
-      title: 'Active Study Techniques Overview',
-      raw_text: 'Active learning strategies like active recall and spaced repetition are highly effective. The Feynman Technique involves teaching topics in simple terms. Spaced repetition uses intervals to combat forgetting.',
-      source_type: 'paste',
-      created_at: new Date().toISOString()
-    }
-    const defaultConcepts: Concept[] = [
-      {
-        id: 'con-1',
-        material_id: 'mat-1',
-        subject_id: 'sub-1',
-        name: 'Active Recall',
-        summary: 'Active recall involves retrieving information from memory rather than passively rereading it. By forcing the brain to retrieve a concept, you strengthen neural pathways. This technique makes learning more durable over time. It is one of the most effective study strategies known.',
-        simple_explanation: 'Instead of just looking at your notes, you hide them and try to explain the concept from memory. It\'s like testing your muscles by lifting weights rather than just watching someone else lift them.',
-        created_at: new Date().toISOString()
-      },
-      {
-        id: 'con-2',
-        material_id: 'mat-1',
-        subject_id: 'sub-1',
-        name: 'Spaced Repetition',
-        summary: 'Spaced repetition is a learning technique where reviews are systematically spaced out over increasing intervals. It exploits the psychological forgetting curve. Reviewing a concept just as you are about to forget it optimizes memory consolidation. This prevents cramming and builds long-term recall.',
-        simple_explanation: 'Reviewing information at increasing intervals (e.g., 1 day, 3 days, 1 week) to push it into long-term memory. It is like watering a plant: watering it a little bit regularly is much healthier than dumping a bucket of water on it once a month.',
-        created_at: new Date().toISOString()
-      }
-    ]
-    const defaultQuestions: Question[] = [
-      {
-        id: 'q-1',
-        concept_id: 'con-1',
-        question_type: 'mcq',
-        prompt: 'Which of the following is the main benefit of active recall?',
-        options: [
-          'It allows you to read faster.',
-          'It strengthens neural pathways by retrieving information.',
-          'It requires less mental effort than rereading.',
-          'It helps you memorize essays word-for-word.'
-        ],
-        correct_answer: 'It strengthens neural pathways by retrieving information.',
-        difficulty: 1,
-        created_at: new Date().toISOString()
-      },
-      {
-        id: 'q-2',
-        concept_id: 'con-1',
-        question_type: 'short_answer',
-        prompt: 'How does active recall differ from passive rereading?',
-        options: null,
-        correct_answer: 'Active recall retrieves info from memory; passive reading just reviews it on the page.',
-        difficulty: 3,
-        created_at: new Date().toISOString()
-      },
-      {
-        id: 'q-3',
-        concept_id: 'con-2',
-        question_type: 'flashcard',
-        prompt: 'Spaced Repetition',
-        options: null,
-        correct_answer: 'Reviewing information at increasing intervals (e.g. 1 day, 3 days, 1 week) to optimize long term retention.',
-        difficulty: 1,
-        created_at: new Date().toISOString()
-      }
-    ]
-    const defaultMastery: Mastery[] = [
-      { id: 'm-1', concept_id: 'con-1', user_id: MOCK_USER_ID, score: 65, last_updated: new Date().toISOString() },
-      { id: 'm-2', concept_id: 'con-2', user_id: MOCK_USER_ID, score: 45, last_updated: new Date().toISOString() }
-    ]
-
-    mockDb.setSubjects([defaultSubject])
-    mockDb.setMaterials([defaultMaterial])
-    mockDb.setConcepts(defaultConcepts)
-    mockDb.setQuestions(defaultQuestions)
-    mockDb.setMastery(defaultMastery)
-  }
+  // Clean initialization: start with a clean slate without dummy concepts
 }
 
 // ----------------- UNIFIED DB API -----------------
@@ -481,13 +399,45 @@ export async function dbCreateQuestions(
 export async function dbDeleteConcept(conceptId: string): Promise<void> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    // Delete cascade dependencies
-    await supabase.from('attempts').delete().filter('question_id', 'in', `(select id from questions where concept_id = '${conceptId}')`)
-    await supabase.from('questions').delete().eq('concept_id', conceptId)
+    
+    // 1. Fetch question IDs belonging to this concept
+    const { data: questions } = await supabase
+      .from('questions')
+      .select('id')
+      .eq('concept_id', conceptId)
+
+    const questionIds = (questions || []).map(q => q.id)
+
+    if (questionIds.length > 0) {
+      // 2. Delete test student attempts referencing these questions
+      await supabase
+        .from('test_student_attempts')
+        .delete()
+        .in('question_id', questionIds)
+
+      // 3. Delete normal practice attempts referencing these questions
+      await supabase
+        .from('attempts')
+        .delete()
+        .in('question_id', questionIds)
+
+      // 4. Delete the questions themselves
+      const { error: qErr } = await supabase
+        .from('questions')
+        .delete()
+        .in('id', questionIds)
+      if (qErr) console.warn('Questions delete warning:', qErr)
+    }
+
+    // 5. Delete mastery
     await supabase.from('mastery').delete().eq('concept_id', conceptId)
+
+    // 6. Delete study plan items
     await supabase.from('study_plan_items').delete().eq('concept_id', conceptId)
-    const { error } = await supabase.from('concepts').delete().eq('id', conceptId)
-    if (error) throw error
+
+    // 7. Finally delete the concept
+    const { error: cErr } = await supabase.from('concepts').delete().eq('id', conceptId)
+    if (cErr) throw cErr
   } else {
     mockDb.setQuestions(mockDb.getQuestions().filter(q => q.concept_id !== conceptId))
     mockDb.setMastery(mockDb.getMastery().filter(m => m.concept_id !== conceptId))
@@ -513,6 +463,43 @@ export async function dbDeleteMaterial(materialId: string): Promise<void> {
       await dbDeleteConcept(c.id)
     }
     mockDb.setMaterials(mockDb.getMaterials().filter(m => m.id !== materialId))
+  }
+}
+
+export async function dbDeleteSubject(subjectId: string): Promise<void> {
+  if (isSupabaseConfigured()) {
+    const supabase = getSupabaseClient()!
+    // 1. Delete all materials (which cascades to concepts, questions, attempts)
+    const { data: materials } = await supabase.from('materials').select('id').eq('subject_id', subjectId)
+    if (materials && materials.length > 0) {
+      for (const m of materials) {
+        await dbDeleteMaterial(m.id)
+      }
+    }
+    // 2. Delete any orphaned concepts under this subject
+    const { data: concepts } = await supabase.from('concepts').select('id').eq('subject_id', subjectId)
+    if (concepts && concepts.length > 0) {
+      for (const c of concepts) {
+        await dbDeleteConcept(c.id)
+      }
+    }
+    // 3. Delete any tests under this subject
+    const { data: tests } = await supabase.from('tests').select('id').eq('subject_id', subjectId)
+    if (tests && tests.length > 0) {
+      const testIds = tests.map(t => t.id)
+      await supabase.from('test_student_attempts').delete().in('test_id', testIds)
+      await supabase.from('test_students').delete().in('test_id', testIds)
+      await supabase.from('tests').delete().in('id', testIds)
+    }
+    // 4. Finally delete the subject
+    const { error } = await supabase.from('subjects').delete().eq('id', subjectId)
+    if (error) throw error
+  } else {
+    const materials = mockDb.getMaterials().filter(m => m.subject_id === subjectId)
+    for (const m of materials) {
+      await dbDeleteMaterial(m.id)
+    }
+    mockDb.setSubjects(mockDb.getSubjects().filter(s => s.id !== subjectId))
   }
 }
 

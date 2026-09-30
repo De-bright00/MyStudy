@@ -5,14 +5,25 @@ export interface AppConfig {
   aiApiKey: string
 }
 
+const DEFAULT_SUPABASE_URL = 'https://xznolrddcddcjynaavxe.supabase.co'
+const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh6bm9scmRkY2RkY2p5bmFhdnhlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyODQ4MzksImV4cCI6MjEwMjg2MDgzOX0.aDZWRC621kY6xhmHJl3QmyPv3Mgx6dSLTrQBNx0ydnk'
+
 export function getConfig(): AppConfig {
-  const envKey = (import.meta.env.VITE_AI_API_KEY || import.meta.env.VITE_GEMINI_API_KEY || '').trim()
   const localKey = (localStorage.getItem('STUDY_AI_API_KEY') || localStorage.getItem('STUDY_GEMINI_API_KEY') || '').trim()
-  const activeKey = envKey || localKey
+  const envKey = (import.meta.env.VITE_AI_API_KEY || import.meta.env.VITE_GEMINI_API_KEY || '').trim()
+  const activeKey = localKey || envKey
+
+  const localSupabaseUrl = (localStorage.getItem('STUDY_SUPABASE_URL') || '').trim()
+  const envSupabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim()
+  const activeSupabaseUrl = localSupabaseUrl || envSupabaseUrl || DEFAULT_SUPABASE_URL
+
+  const localSupabaseKey = (localStorage.getItem('STUDY_SUPABASE_ANON_KEY') || '').trim()
+  const envSupabaseKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim()
+  const activeSupabaseKey = localSupabaseKey || envSupabaseKey || DEFAULT_SUPABASE_ANON_KEY
 
   return {
-    supabaseUrl: (localStorage.getItem('STUDY_SUPABASE_URL') || import.meta.env.VITE_SUPABASE_URL || '').trim(),
-    supabaseAnonKey: (localStorage.getItem('STUDY_SUPABASE_ANON_KEY') || import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim(),
+    supabaseUrl: activeSupabaseUrl,
+    supabaseAnonKey: activeSupabaseKey,
     geminiApiKey: activeKey,
     aiApiKey: activeKey,
   }
