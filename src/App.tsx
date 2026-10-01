@@ -36,6 +36,7 @@ import {
   generateQuestions, 
   generateQuestionsFromMaterial,
   type QuestionSettingType,
+  type ExtractedConcept,
   evaluateAnswer, 
   checkGuidedHelpGuardrail,
   generateStudyPlanReason
@@ -49,6 +50,7 @@ import {
   dbFetchSubjects,
   dbCreateSubject,
   dbCreateMaterial,
+  dbFetchMaterials,
   dbFetchConcepts,
   dbCreateConcepts,
   dbFetchQuestions,
@@ -118,6 +120,7 @@ export default function App() {
   const [newTestTitle, setNewTestTitle] = useState('')
   const [newTestSubjectId, setNewTestSubjectId] = useState('')
   const [newTestQuestionCount, setNewTestQuestionCount] = useState(5)
+  const [newTestQuestionType, setNewTestQuestionType] = useState<QuestionSettingType>('mixed')
   const [newTestDisableGuidance, setNewTestDisableGuidance] = useState(false)
 
   // Core Data State
@@ -1693,6 +1696,23 @@ export default function App() {
                               <div className="max-w-[70%]">
                                 <h4 className="text-base font-bold text-slate-800 truncate">{matchedTest.title}</h4>
                                 <p className="text-xs text-slate-400 mt-0.5">Subject: {matchedTest.subject_name}</p>
+                                <div className="flex items-center gap-1.5 mt-2">
+                                  <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border ${
+                                    matchedTest.question_type === 'objective' ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                                    matchedTest.question_type === 'theory' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
+                                    matchedTest.question_type === 'body' ? 'bg-purple-50 text-purple-700 border-purple-200' :
+                                    'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  }`}>
+                                    {matchedTest.question_type === 'objective' ? 'Obj (MCQ)' :
+                                     matchedTest.question_type === 'theory' ? 'Theory' :
+                                     matchedTest.question_type === 'body' ? 'Essay' : 'Mix (All)'}
+                                  </span>
+                                  {matchedTest.disable_guidance && (
+                                    <span className="text-[9px] font-bold uppercase tracking-wider text-rose-600 bg-rose-50 px-2 py-0.5 rounded">
+                                      Strict Mode
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                               <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
                                 enroll.completed ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
@@ -1712,7 +1732,7 @@ export default function App() {
                             ) : (
                               <div className="mb-4 bg-slate-50 border border-slate-100 rounded-xl p-4 flex items-center justify-between">
                                 <div>
-                                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block leading-tight">Questions</span>
+                                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block leading-tight">Format & Count</span>
                                   <span className="text-lg font-extrabold text-slate-800 mt-0.5 block">{matchedTest.question_count} Questions</span>
                                 </div>
                                 <button
@@ -1725,12 +1745,54 @@ export default function App() {
                                         allQuestions.push(...conceptQuestions)
                                       }
 
-                                      if (allQuestions.length === 0) {
+                                      const reqType = matchedTest.question_type || 'mixed'
+                                      let candidateQuestions = allQuestions.filter(q => {
+                                        if (reqType === 'objective') return q.question_type === 'mcq' || q.sub_type === 'objective'
+                                        if (reqType === 'theory') return q.sub_type === 'theory' || (q.question_type === 'short_answer' && q.sub_type !== 'body')
+                                        if (reqType === 'body') return q.sub_type === 'body'
+                                        return true
+                                      })
+
+                                      // Auto-generate missing questions if fewer than question_count
+                                      if (candidateQuestions.length < matchedTest.question_count && subjectConcepts.length > 0) {
+                                        try {
+                                          const mats = await dbFetchMaterials(matchedTest.subject_id)
+                                          if (mats.length > 0 && mats[0].raw_text) {
+                                            const needed = Math.max(matchedTest.question_count - candidateQuestions.length, 5)
+                                            const extractedConcepts: ExtractedConcept[] = subjectConcepts.map(c => ({
+                                              name: c.name,
+                                              summary: c.summary,
+                                              simple_explanation: c.simple_explanation
+                                            }))
+                                            const generated = await generateQuestionsFromMaterial(
+                                              mats[0].title,
+                                              mats[0].raw_text,
+                                              needed,
+                                              reqType,
+                                              extractedConcepts
+                                            )
+                                            for (let i = 0; i < generated.length; i++) {
+                                              const gq = generated[i]
+                                              const targetConcept = subjectConcepts.find(c => c.name.toLowerCase() === gq.concept_name?.toLowerCase()) || subjectConcepts[i % subjectConcepts.length]
+                                              const created = await dbCreateQuestions([gq], targetConcept.id)
+                                              candidateQuestions.push(...created)
+                                            }
+                                          }
+                                        } catch (genErr) {
+                                          console.warn('Note: could not dynamically generate questions:', genErr)
+                                        }
+                                      }
+
+                                      if (candidateQuestions.length === 0) {
+                                        candidateQuestions = allQuestions
+                                      }
+
+                                      if (candidateQuestions.length === 0) {
                                         alert('This test subject does not have any questions generated yet.')
                                         return
                                       }
 
-                                      const shuffled = [...allQuestions].sort(() => 0.5 - Math.random()).slice(0, matchedTest.question_count)
+                                      const shuffled = [...candidateQuestions].sort(() => 0.5 - Math.random()).slice(0, matchedTest.question_count)
                                       setQuizQuestions(shuffled)
                                       setActiveQuestionIdx(0)
                                       setStudentAnswer('')
@@ -2660,32 +2722,77 @@ export default function App() {
             <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
               <h2 className="text-xl font-bold text-slate-800 mb-2">Create a Test / Training Assessment</h2>
               <p className="text-xs text-slate-500 mb-6">
-                Upload your document in the Subjects tab first, then set questions count and invite students or workers to join.
+                Select your subject material, choose the question type format (Objective, Theory, Essay, or Mix), and generate an assessment code for students to take.
               </p>
 
               <form 
                 onSubmit={async (e) => {
                   e.preventDefault()
                   if (!newTestTitle.trim() || !newTestSubjectId) {
-                    alert('Please provide a title and select a subject.')
+                    alert('Please provide a test title and select a subject.')
                     return
                   }
                   setIsCreatingTest(true)
                   try {
+                    // 1. Create test and generate code
                     const newTest = await dbCreateTest(
                       session.user.id,
                       newTestTitle.trim(),
                       newTestSubjectId,
                       newTestQuestionCount,
-                      newTestDisableGuidance
+                      newTestDisableGuidance,
+                      newTestQuestionType
                     )
-                    alert(`Test created! Invitation Code: ${newTest.code}`)
+
+                    // 2. Ensure questions matching this type are available for the subject
+                    try {
+                      const subjectConcepts = await dbFetchConcepts(newTestSubjectId)
+                      let matchingQs: Question[] = []
+                      for (const c of subjectConcepts) {
+                        const qs = await dbFetchQuestions(c.id)
+                        const filtered = qs.filter(q => {
+                          if (newTestQuestionType === 'objective') return q.question_type === 'mcq' || q.sub_type === 'objective'
+                          if (newTestQuestionType === 'theory') return q.sub_type === 'theory' || (q.question_type === 'short_answer' && q.sub_type !== 'body')
+                          if (newTestQuestionType === 'body') return q.sub_type === 'body'
+                          return true
+                        })
+                        matchingQs.push(...filtered)
+                      }
+
+                      // If fewer questions of this type than requested, auto-generate them from materials!
+                      if (matchingQs.length < newTestQuestionCount && subjectConcepts.length > 0) {
+                        const mats = await dbFetchMaterials(newTestSubjectId)
+                        if (mats.length > 0 && mats[0].raw_text) {
+                          const needed = Math.max(newTestQuestionCount - matchingQs.length, 5)
+                          const extractedConcepts: ExtractedConcept[] = subjectConcepts.map(c => ({
+                            name: c.name,
+                            summary: c.summary,
+                            simple_explanation: c.simple_explanation
+                          }))
+                          const generated = await generateQuestionsFromMaterial(
+                            mats[0].title,
+                            mats[0].raw_text,
+                            needed,
+                            newTestQuestionType,
+                            extractedConcepts
+                          )
+                          for (let i = 0; i < generated.length; i++) {
+                            const gq = generated[i]
+                            const targetConcept = subjectConcepts.find(c => c.name.toLowerCase() === gq.concept_name?.toLowerCase()) || subjectConcepts[i % subjectConcepts.length]
+                            await dbCreateQuestions([gq], targetConcept.id)
+                          }
+                        }
+                      }
+                    } catch (genErr) {
+                      console.warn('Note: could not pre-generate extra questions for test:', genErr)
+                    }
+
+                    alert(`🎉 Test Created Successfully!\n\n📋 Title: "${newTest.title}"\n🔑 Student Invitation Code: ${newTest.code}\n📝 Format: ${newTestQuestionType.toUpperCase()}\n🔢 Questions: ${newTestQuestionCount}\n\nStudents can now enter this code on their dashboard to take the test!`)
                     setNewTestTitle('')
                     setNewTestDisableGuidance(false)
-                    // Reload
                     loadUserData()
                   } catch (err: any) {
-                    alert('Failed to create test: ' + err.message)
+                    alert('Failed to create test: ' + (err.message || err))
                   } finally {
                     setIsCreatingTest(false)
                   }
@@ -2700,7 +2807,7 @@ export default function App() {
                     <input
                       type="text"
                       required
-                      placeholder="e.g. Work Ethics Assessment"
+                      placeholder="e.g. Computer Studies Midterm Exam"
                       value={newTestTitle}
                       onChange={(e) => setNewTestTitle(e.target.value)}
                       className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs shadow-sm focus:ring-violet-500 focus:border-violet-500 font-medium"
@@ -2760,13 +2867,92 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Question Type Selection (Obj, Theory, Essay, Mix) */}
+                <div className="md:col-span-2 space-y-2 pt-2 border-t border-slate-100">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-600 uppercase tracking-wider">
+                      Question Type Format
+                    </label>
+                    <span className="text-[11px] text-indigo-600 font-semibold">
+                      Selected: {
+                        newTestQuestionType === 'objective' ? 'Objective (MCQ)' :
+                        newTestQuestionType === 'theory' ? 'Theory (Conceptual)' :
+                        newTestQuestionType === 'body' ? 'Essay (Body/Analytical)' : 'Mix (Obj + Theory + Essay)'
+                      }
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {[
+                      {
+                        id: 'objective',
+                        title: 'Obj (Multiple Choice)',
+                        badge: 'MCQ',
+                        desc: 'Multiple-choice questions with 4 distinct options & automated grading.',
+                        icon: CheckCircle
+                      },
+                      {
+                        id: 'theory',
+                        title: 'Theory (Conceptual)',
+                        badge: 'Short Answer',
+                        desc: 'Conceptual questions testing core principles, definitions & key mechanisms.',
+                        icon: Brain
+                      },
+                      {
+                        id: 'body',
+                        title: 'Essay (Body)',
+                        badge: 'Analytical',
+                        desc: 'Structured, in-depth analytical questions testing comprehensive mastery.',
+                        icon: FileText
+                      },
+                      {
+                        id: 'mixed',
+                        title: 'Mix (All Types)',
+                        badge: 'Recommended',
+                        desc: 'Balanced combination of Objective MCQs + Theory & Essay questions.',
+                        icon: Sparkles
+                      }
+                    ].map(t => {
+                      const IconComp = t.icon
+                      const isSelected = newTestQuestionType === t.id
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => setNewTestQuestionType(t.id as QuestionSettingType)}
+                          className={`text-left p-3.5 rounded-xl border text-xs transition-all cursor-pointer flex flex-col justify-between ${
+                            isSelected
+                              ? 'border-indigo-600 bg-indigo-50/80 ring-2 ring-indigo-500/20 shadow-sm'
+                              : 'border-slate-200 bg-white hover:bg-slate-50'
+                          }`}
+                        >
+                          <div>
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                              <div className={`p-1.5 rounded-lg ${isSelected ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                                <IconComp className="h-4 w-4" />
+                              </div>
+                              <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
+                                isSelected ? 'bg-indigo-200/60 text-indigo-900' : 'bg-slate-100 text-slate-500'
+                              }`}>
+                                {t.badge}
+                              </span>
+                            </div>
+                            <h4 className={`font-bold text-sm mb-1 ${isSelected ? 'text-indigo-950' : 'text-slate-800'}`}>{t.title}</h4>
+                            <p className="text-[11px] text-slate-500 leading-snug">{t.desc}</p>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
                 <div className="md:col-span-2 pt-2">
                   <button
                     type="submit"
                     disabled={isCreatingTest}
                     className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer disabled:opacity-50 transition-all hover:-translate-y-0.5"
                   >
-                    {isCreatingTest ? 'Creating Test...' : 'Create Test & Generate Code'}
+                    {isCreatingTest ? 'Creating Test & Generating Code...' : 'Create Test & Generate Code'}
                   </button>
                 </div>
               </form>
@@ -2784,12 +2970,22 @@ export default function App() {
                           <h4 className="text-base font-bold text-slate-800 truncate">{test.title}</h4>
                           <p className="text-xs text-slate-400 mt-0.5">Subject: {test.subject_name}</p>
                         </div>
-                        <div className="text-right">
+                        <div className="text-right flex flex-col items-end gap-1">
+                          <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border ${
+                            test.question_type === 'objective' ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                            test.question_type === 'theory' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
+                            test.question_type === 'body' ? 'bg-purple-50 text-purple-700 border-purple-200' :
+                            'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          }`}>
+                            {test.question_type === 'objective' ? 'Obj (MCQ)' :
+                             test.question_type === 'theory' ? 'Theory' :
+                             test.question_type === 'body' ? 'Essay' : 'Mix (All)'}
+                          </span>
                           <span className="text-[10px] font-bold uppercase tracking-wider text-violet-600 bg-violet-50 px-2 py-0.5 rounded">
                             {test.question_count} Questions
                           </span>
                           {test.disable_guidance && (
-                            <span className="text-[9px] font-bold uppercase tracking-wider text-rose-600 bg-rose-50 px-2 py-0.5 rounded block mt-1">
+                            <span className="text-[9px] font-bold uppercase tracking-wider text-rose-600 bg-rose-50 px-2 py-0.5 rounded block">
                               Guidance Disabled
                             </span>
                           )}
@@ -2820,6 +3016,10 @@ export default function App() {
                           try {
                             const scores = await dbFetchTestScores(test.id)
                             // Show student results dialog
+                            if (scores.length === 0) {
+                              alert(`No students have taken "${test.title}" yet.\nShare invitation code: ${test.code}`)
+                              return
+                            }
                             alert(`Loaded student scores for "${test.title}":\n\n` + 
                               scores.map((s: TestStudent) => `- ${s.student_email}: ${s.completed ? `${s.score}%` : 'In Progress'}`).join('\n')
                             )
@@ -2840,7 +3040,7 @@ export default function App() {
                     <FileText className="h-12 w-12 text-slate-300 mx-auto mb-4" />
                     <h3 className="text-lg font-bold text-slate-800">No tests created yet</h3>
                     <p className="text-sm text-slate-500 mt-1 max-w-sm mx-auto">
-                      Generate questions for your materials first, then fill out the form above to invite workers or students.
+                      Fill out the form above to create an assessment and generate an invitation code for your students.
                     </p>
                   </div>
                 )}

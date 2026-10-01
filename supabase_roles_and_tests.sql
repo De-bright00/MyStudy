@@ -40,10 +40,16 @@ create table if not exists public.tests (
   title text not null,
   subject_id uuid references public.subjects on delete cascade not null,
   question_count int not null default 5 check (question_count > 0),
+  question_type text not null default 'mixed' check (question_type in ('objective', 'theory', 'body', 'mixed')),
   disable_guidance boolean not null default false,
   code text not null unique check (length(code) = 6),
   created_at timestamptz default now()
 );
+
+-- Ensure columns exist even if table was previously created with an older schema
+alter table public.tests add column if not exists title text;
+alter table public.tests add column if not exists question_type text default 'mixed';
+alter table public.tests add column if not exists disable_guidance boolean default false;
 
 alter table public.tests enable row level security;
 
@@ -160,3 +166,7 @@ create policy "Authenticated users can select questions"
   on public.questions for select
   to authenticated
   using (true);
+
+-- 8. Reload PostgREST schema cache
+notify pgrst, 'reload schema';
+

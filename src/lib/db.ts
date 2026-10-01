@@ -87,12 +87,15 @@ export interface UserProfile {
   avatar_url?: string | null
 }
 
+export type QuestionSettingType = 'objective' | 'theory' | 'body' | 'mixed'
+
 export interface Test {
   id: string
   teacher_id: string
   title: string
   subject_id: string
   question_count: number
+  question_type: QuestionSettingType
   disable_guidance: boolean
   code: string
   created_at: string
@@ -112,6 +115,7 @@ export interface TestStudent {
   test_title?: string
   student_email?: string
   subject_id?: string
+  question_type?: QuestionSettingType
 }
 
 export interface TestStudentAttempt {
@@ -861,6 +865,27 @@ export async function dbUpdateUserProfile(
 
 // --- TESTING APIs ---
 
+function getTestMeta(id?: string, code?: string): { title?: string; question_type?: QuestionSettingType } | null {
+  try {
+    if (id) {
+      const byId = localStorage.getItem(`mystudy_test_meta_${id}`)
+      if (byId) return JSON.parse(byId)
+    }
+    if (code) {
+      const byCode = localStorage.getItem(`mystudy_test_meta_code_${code}`)
+      if (byCode) return JSON.parse(byCode)
+    }
+  } catch (e) {}
+  return null
+}
+
+function saveTestMeta(id: string, code: string, meta: { title: string; question_type: QuestionSettingType }) {
+  try {
+    localStorage.setItem(`mystudy_test_meta_${id}`, JSON.stringify(meta))
+    localStorage.setItem(`mystudy_test_meta_code_${code}`, JSON.stringify(meta))
+  } catch (e) {}
+}
+
 export async function dbFetchTests(userId: string, role: 'teacher' | 'student'): Promise<Test[]> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
@@ -871,17 +896,21 @@ export async function dbFetchTests(userId: string, role: 'teacher' | 'student'):
         .eq('teacher_id', userId)
         .order('created_at', { ascending: false })
       if (error) throw error
-      return (data || []).map(row => ({
-        id: row.id,
-        teacher_id: row.teacher_id,
-        title: row.title,
-        subject_id: row.subject_id,
-        question_count: row.question_count,
-        disable_guidance: row.disable_guidance,
-        code: row.code,
-        created_at: row.created_at,
-        subject_name: row.subjects?.name || 'Unknown Subject'
-      }))
+      return (data || []).map(row => {
+        const meta = getTestMeta(row.id, row.code)
+        return {
+          id: row.id,
+          teacher_id: row.teacher_id,
+          title: row.title || meta?.title || row.subjects?.name || 'Assessment Test',
+          subject_id: row.subject_id,
+          question_count: row.question_count,
+          question_type: (row.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
+          disable_guidance: row.disable_guidance,
+          code: row.code,
+          created_at: row.created_at,
+          subject_name: row.subjects?.name || 'Unknown Subject'
+        }
+      })
     } else {
       // For student, fetch tests they have joined/enrolled in
       const { data, error } = await supabase
@@ -889,17 +918,21 @@ export async function dbFetchTests(userId: string, role: 'teacher' | 'student'):
         .select('*, tests(*, subjects(name))')
         .eq('student_id', userId)
       if (error) throw error
-      return (data || []).map(row => ({
-        id: row.tests.id,
-        teacher_id: row.tests.teacher_id,
-        title: row.tests.title,
-        subject_id: row.tests.subject_id,
-        question_count: row.tests.question_count,
-        disable_guidance: row.tests.disable_guidance,
-        code: row.tests.code,
-        created_at: row.tests.created_at,
-        subject_name: row.tests.subjects?.name || 'Unknown Subject'
-      }))
+      return (data || []).filter(row => !!row.tests).map(row => {
+        const meta = getTestMeta(row.tests.id, row.tests.code)
+        return {
+          id: row.tests.id,
+          teacher_id: row.tests.teacher_id,
+          title: row.tests.title || meta?.title || row.tests.subjects?.name || 'Assessment Test',
+          subject_id: row.tests.subject_id,
+          question_count: row.tests.question_count,
+          question_type: (row.tests.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
+          disable_guidance: row.tests.disable_guidance,
+          code: row.tests.code,
+          created_at: row.tests.created_at,
+          subject_name: row.tests.subjects?.name || 'Unknown Subject'
+        }
+      })
     }
   } else {
     // Mock storage tests
@@ -910,6 +943,7 @@ export async function dbFetchTests(userId: string, role: 'teacher' | 'student'):
         .filter(t => t.teacher_id === userId)
         .map(t => ({
           ...t,
+          question_type: t.question_type || 'mixed',
           subject_name: subjects.find(s => s.id === t.subject_id)?.name || 'Unknown Subject'
         }))
     } else {
@@ -918,7 +952,8 @@ export async function dbFetchTests(userId: string, role: 'teacher' | 'student'):
         const t = allTests.find(tst => tst.id === e.test_id)!
         return {
           ...t,
-          subject_name: subjects.find(s => s.id === t.subject_id)?.name || 'Unknown Subject'
+          question_type: t?.question_type || 'mixed',
+          subject_name: subjects.find(s => s.id === t?.subject_id)?.name || 'Unknown Subject'
         }
       })
     }
@@ -930,7 +965,8 @@ export async function dbCreateTest(
   title: string,
   subjectId: string,
   questionCount: number,
-  disableGuidance: boolean
+  disableGuidance: boolean,
+  questionType: QuestionSettingType = 'mixed'
 ): Promise<Test> {
   // Generate random 6-character alphanumeric uppercase code
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -941,13 +977,102 @@ export async function dbCreateTest(
 
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase
+    let data: any = null
+
+    // Attempt 1: Full insert with title and question_type
+    const res1 = await supabase
       .from('tests')
-      .insert({ teacher_id: teacherId, title, subject_id: subjectId, question_count: questionCount, disable_guidance: disableGuidance, code })
+      .insert({
+        teacher_id: teacherId,
+        title,
+        subject_id: subjectId,
+        question_count: questionCount,
+        question_type: questionType,
+        disable_guidance: disableGuidance,
+        code
+      })
       .select()
       .single()
-    if (error) throw error
-    return data
+
+    if (!res1.error) {
+      data = res1.data
+    } else {
+      console.warn('Initial test insert failed, testing schema column compatibility:', res1.error)
+      const err1 = (res1.error.message || '').toLowerCase()
+
+      // If question_type is missing in schema cache
+      if (err1.includes('question_type')) {
+        const res2 = await supabase
+          .from('tests')
+          .insert({
+            teacher_id: teacherId,
+            title,
+            subject_id: subjectId,
+            question_count: questionCount,
+            disable_guidance: disableGuidance,
+            code
+          })
+          .select()
+          .single()
+
+        if (!res2.error) {
+          data = res2.data
+        } else {
+          const err2 = (res2.error.message || '').toLowerCase()
+          if (err2.includes('title')) {
+            // title is also missing in DB
+            const res3 = await supabase
+              .from('tests')
+              .insert({
+                teacher_id: teacherId,
+                subject_id: subjectId,
+                question_count: questionCount,
+                disable_guidance: disableGuidance,
+                code
+              })
+              .select()
+              .single()
+
+            if (res3.error) throw res3.error
+            data = res3.data
+          } else {
+            throw res2.error
+          }
+        }
+      } else if (err1.includes('title')) {
+        // title is missing in DB
+        const res2 = await supabase
+          .from('tests')
+          .insert({
+            teacher_id: teacherId,
+            subject_id: subjectId,
+            question_count: questionCount,
+            disable_guidance: disableGuidance,
+            code
+          })
+          .select()
+          .single()
+
+        if (res2.error) throw res2.error
+        data = res2.data
+      } else {
+        throw res1.error
+      }
+    }
+
+    saveTestMeta(data.id, code, { title, question_type: questionType })
+
+    return {
+      id: data.id,
+      teacher_id: data.teacher_id,
+      title: data.title || title,
+      subject_id: data.subject_id,
+      question_count: data.question_count,
+      question_type: (data.question_type || questionType) as QuestionSettingType,
+      disable_guidance: data.disable_guidance,
+      code: data.code,
+      created_at: data.created_at
+    }
   } else {
     const newTest: Test = {
       id: 'test-' + Math.random().toString(36).substr(2, 9),
@@ -955,12 +1080,14 @@ export async function dbCreateTest(
       title,
       subject_id: subjectId,
       question_count: questionCount,
+      question_type: questionType,
       disable_guidance: disableGuidance,
       code,
       created_at: new Date().toISOString()
     }
     const current = mockDb.getTests()
     mockDb.setTests([newTest, ...current])
+    saveTestMeta(newTest.id, code, { title, question_type: questionType })
     return newTest
   }
 }
@@ -976,12 +1103,14 @@ export async function dbFetchTestDetails(code: string): Promise<Test | null> {
       .maybeSingle()
     if (error) throw error
     if (!data) return null
+    const meta = getTestMeta(data.id, data.code)
     return {
       id: data.id,
       teacher_id: data.teacher_id,
-      title: data.title,
+      title: data.title || meta?.title || data.subjects?.name || 'Assessment Test',
       subject_id: data.subject_id,
       question_count: data.question_count,
+      question_type: (data.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
       disable_guidance: data.disable_guidance,
       code: data.code,
       created_at: data.created_at,
@@ -992,8 +1121,10 @@ export async function dbFetchTestDetails(code: string): Promise<Test | null> {
     const subjects = mockDb.getSubjects()
     const test = allTests.find(t => t.code === cleanCode)
     if (!test) return null
+    const meta = getTestMeta(test.id, test.code)
     return {
       ...test,
+      question_type: (test.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
       subject_name: subjects.find(s => s.id === test.subject_id)?.name || 'Unknown Subject'
     }
   }
@@ -1042,29 +1173,36 @@ export async function dbFetchEnrolledTests(studentId: string): Promise<TestStude
     const supabase = getSupabaseClient()!
     const { data, error } = await supabase
       .from('test_students')
-      .select('*, tests(*)')
+      .select('*, tests(*, subjects(name))')
       .eq('student_id', studentId)
+      .order('started_at', { ascending: false })
     if (error) throw error
-    return (data || []).map(row => ({
-      id: row.id,
-      test_id: row.test_id,
-      student_id: row.student_id,
-      completed: row.completed,
-      score: row.score === null ? null : Number(row.score),
-      started_at: row.started_at,
-      completed_at: row.completed_at,
-      test_title: row.tests?.title || 'Unknown Test',
-      subject_id: row.tests?.subject_id
-    }))
+    return (data || []).map(row => {
+      const meta = getTestMeta(row.tests?.id, row.tests?.code)
+      return {
+        id: row.id,
+        test_id: row.test_id,
+        student_id: row.student_id,
+        completed: row.completed,
+        score: row.score === null ? null : Number(row.score),
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+        test_title: row.tests?.title || meta?.title || row.tests?.subjects?.name || 'Unknown Test',
+        subject_id: row.tests?.subject_id,
+        question_type: (row.tests?.question_type || meta?.question_type || 'mixed') as QuestionSettingType
+      }
+    })
   } else {
     const enrollments = mockDb.getTestStudents().filter(ts => ts.student_id === studentId)
     const tests = mockDb.getTests()
     return enrollments.map(e => {
       const t = tests.find(tst => tst.id === e.test_id)
+      const meta = getTestMeta(t?.id, t?.code)
       return {
         ...e,
-        test_title: t?.title || 'Unknown Test',
-        subject_id: t?.subject_id
+        test_title: t?.title || meta?.title || 'Unknown Test',
+        subject_id: t?.subject_id,
+        question_type: (t?.question_type || meta?.question_type || 'mixed') as QuestionSettingType
       }
     })
   }
