@@ -122,6 +122,27 @@ create policy "Students can view tests they are enrolled in or search by code"
   using (true); -- allowed to fetch test details via invitation code search
 
 -- Test Students Policies
+drop policy if exists "Students can insert test enrollment" on public.test_students;
+create policy "Students can insert test enrollment"
+  on public.test_students for insert
+  to authenticated
+  with check (true);
+
+drop policy if exists "Students can update their own test enrollment" on public.test_students;
+create policy "Students can update their own test enrollment"
+  on public.test_students for update
+  to authenticated
+  using (auth.uid() = student_id)
+  with check (auth.uid() = student_id);
+
+drop policy if exists "Students can view their own test enrollment" on public.test_students;
+drop policy if exists "Students can join and manage their own test sessions" on public.test_students;
+create policy "Students can view their own test enrollment"
+  on public.test_students for select
+  to authenticated
+  using (auth.uid() = student_id);
+
+drop policy if exists "Teachers can view grades for their tests" on public.test_students;
 create policy "Teachers can view grades for their tests"
   on public.test_students for select
   to authenticated
@@ -133,13 +154,21 @@ create policy "Teachers can view grades for their tests"
     )
   );
 
-create policy "Students can join and manage their own test sessions"
-  on public.test_students for all
-  to authenticated
-  using (auth.uid() = student_id)
-  with check (auth.uid() = student_id);
-
 -- Test Student Attempts Policies
+drop policy if exists "Students can insert their own attempts" on public.test_student_attempts;
+create policy "Students can insert their own attempts"
+  on public.test_student_attempts for insert
+  to authenticated
+  with check (true);
+
+drop policy if exists "Students can select their own attempts" on public.test_student_attempts;
+drop policy if exists "Students can manage their own attempts" on public.test_student_attempts;
+create policy "Students can select their own attempts"
+  on public.test_student_attempts for select
+  to authenticated
+  using (auth.uid() = student_id);
+
+drop policy if exists "Teachers can view student attempts for their tests" on public.test_student_attempts;
 create policy "Teachers can view student attempts for their tests"
   on public.test_student_attempts for select
   to authenticated
@@ -150,12 +179,6 @@ create policy "Teachers can view student attempts for their tests"
       and tests.teacher_id = auth.uid()
     )
   );
-
-create policy "Students can manage their own attempts"
-  on public.test_student_attempts for all
-  to authenticated
-  using (auth.uid() = student_id)
-  with check (auth.uid() = student_id);
 
 -- 7. Student access to educational materials (Read-only SELECT)
 drop policy if exists "Authenticated users can select subjects" on public.subjects;

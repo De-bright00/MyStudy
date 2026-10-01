@@ -188,12 +188,33 @@ export function seedMockData() {
 export async function dbFetchSubjects(userId: string): Promise<Subject[]> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase.from('subjects').select('*').order('created_at', { ascending: false })
+    const { data, error } = await supabase
+      .from('subjects')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
     if (error) throw error
     return data || []
   } else {
-    seedMockData()
     return mockDb.getSubjects().filter(s => s.user_id === userId)
+  }
+}
+
+export async function dbFetchSubjectsByIds(subjectIds: string[]): Promise<Subject[]> {
+  if (subjectIds.length === 0) return []
+  if (isSupabaseConfigured()) {
+    const supabase = getSupabaseClient()!
+    const { data, error } = await supabase
+      .from('subjects')
+      .select('*')
+      .in('id', subjectIds)
+    if (error) {
+      console.warn('Could not fetch subjects by ids:', error)
+      return []
+    }
+    return data || []
+  } else {
+    return mockDb.getSubjects().filter(s => subjectIds.includes(s.id))
   }
 }
 

@@ -52,6 +52,7 @@ import {
 } from './lib/studyLogic'
 import {
   dbFetchSubjects,
+  dbFetchSubjectsByIds,
   dbCreateSubject,
   dbCreateMaterial,
   dbFetchMaterials,
@@ -510,9 +511,15 @@ export default function App() {
         const fetchedSubjects = await dbFetchSubjects(uId)
         setSubjects(fetchedSubjects)
 
-        // Set default subject if none selected
-        if (fetchedSubjects.length > 0 && !currentSubject) {
-          setCurrentSubject(fetchedSubjects[0])
+        // Only keep or select a subject if it belongs to this teacher
+        if (fetchedSubjects.length > 0) {
+          if (!currentSubject || !fetchedSubjects.some(s => s.id === currentSubject.id)) {
+            setCurrentSubject(fetchedSubjects[0])
+          }
+        } else {
+          setCurrentSubject(null)
+          setConcepts([])
+          setCurrentConcept(null)
         }
 
         const fetchedTests = await dbFetchTests(uId, 'teacher')
@@ -526,14 +533,27 @@ export default function App() {
         const fetchedTests = await dbFetchTests(uId, 'student')
         setTests(fetchedTests)
 
-        // Fetch subjects associated with enrolled tests OR created by the student
-        const fetchedSubjects = await dbFetchSubjects(uId) // will fetch all visible subjects thanks to RLS policy
-        const uniqueSubjectIds = Array.from(new Set(fetchedTests.map((t: Test) => t.subject_id)))
-        const filteredSubjects = fetchedSubjects.filter((s: Subject) => uniqueSubjectIds.includes(s.id) || s.user_id === uId)
-        setSubjects(filteredSubjects)
+        // Fetch only subjects created by this student, plus subjects for tests they specifically enrolled in
+        const mySubjects = await dbFetchSubjects(uId)
+        const uniqueSubjectIds = Array.from(new Set(fetchedTests.map((t: Test) => t.subject_id).filter(Boolean)))
+        const enrolledSubjects = uniqueSubjectIds.length > 0 ? await dbFetchSubjectsByIds(uniqueSubjectIds) : []
+        
+        const combined = [...mySubjects]
+        enrolledSubjects.forEach(es => {
+          if (!combined.some(s => s.id === es.id)) {
+            combined.push(es)
+          }
+        })
+        setSubjects(combined)
 
-        if (filteredSubjects.length > 0 && !currentSubject) {
-          setCurrentSubject(filteredSubjects[0])
+        if (combined.length > 0) {
+          if (!currentSubject || !combined.some(s => s.id === currentSubject.id)) {
+            setCurrentSubject(combined[0])
+          }
+        } else {
+          setCurrentSubject(null)
+          setConcepts([])
+          setCurrentConcept(null)
         }
       }
 
@@ -972,8 +992,12 @@ export default function App() {
       feedbackText = grading.feedback
 
       if (activeTest) {
-        // Record test attempt
-        await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, studentAnswer, isCorrect, feedbackText)
+        // Record test attempt (resilient to database RLS errors)
+        try {
+          await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, studentAnswer, isCorrect, feedbackText)
+        } catch (attemptErr) {
+          console.warn('Could not record test attempt log in database:', attemptErr)
+        }
         
         let newCorrectCount = testCorrectCount
         if (isCorrect) {
@@ -1045,7 +1069,11 @@ export default function App() {
         : "No problem. Review this term again. Try summarizing it in your own words next time."
 
       if (activeTest) {
-        await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, '[Self Graded Flashcard]', isCorrect, feedbackText)
+        try {
+          await dbCreateTestAttempt(activeTest.id, uId, activeQ.id, '[Self Graded Flashcard]', isCorrect, feedbackText)
+        } catch (attemptErr) {
+          console.warn('Could not record flashcard attempt log in database:', attemptErr)
+        }
         let newCorrectCount = testCorrectCount
         if (isCorrect) {
           newCorrectCount = testCorrectCount + 1

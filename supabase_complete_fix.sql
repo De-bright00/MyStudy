@@ -48,6 +48,26 @@ ALTER TABLE IF EXISTS public.test_student_attempts
 -- 3. Enable RLS and set policies on test_students
 ALTER TABLE public.test_students ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Students can insert test enrollment" ON public.test_students;
+CREATE POLICY "Students can insert test enrollment"
+  ON public.test_students FOR INSERT
+  TO authenticated
+  WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Students can update their own test enrollment" ON public.test_students;
+CREATE POLICY "Students can update their own test enrollment"
+  ON public.test_students FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = student_id)
+  WITH CHECK (auth.uid() = student_id);
+
+DROP POLICY IF EXISTS "Students can view their own test enrollment" ON public.test_students;
+DROP POLICY IF EXISTS "Students can join and manage their own test sessions" ON public.test_students;
+CREATE POLICY "Students can view their own test enrollment"
+  ON public.test_students FOR SELECT
+  TO authenticated
+  USING (auth.uid() = student_id);
+
 DROP POLICY IF EXISTS "Teachers can view grades for their tests" ON public.test_students;
 CREATE POLICY "Teachers can view grades for their tests"
   ON public.test_students FOR SELECT
@@ -60,15 +80,21 @@ CREATE POLICY "Teachers can view grades for their tests"
     )
   );
 
-DROP POLICY IF EXISTS "Students can join and manage their own test sessions" ON public.test_students;
-CREATE POLICY "Students can join and manage their own test sessions"
-  ON public.test_students FOR ALL
-  TO authenticated
-  USING (auth.uid() = student_id)
-  WITH CHECK (auth.uid() = student_id);
-
 -- 4. Enable RLS and set policies on test_student_attempts
 ALTER TABLE public.test_student_attempts ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Students can insert their own attempts" ON public.test_student_attempts;
+CREATE POLICY "Students can insert their own attempts"
+  ON public.test_student_attempts FOR INSERT
+  TO authenticated
+  WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Students can select their own attempts" ON public.test_student_attempts;
+DROP POLICY IF EXISTS "Students can manage their own attempts" ON public.test_student_attempts;
+CREATE POLICY "Students can select their own attempts"
+  ON public.test_student_attempts FOR SELECT
+  TO authenticated
+  USING (auth.uid() = student_id);
 
 DROP POLICY IF EXISTS "Teachers can view student attempts for their tests" ON public.test_student_attempts;
 CREATE POLICY "Teachers can view student attempts for their tests"
@@ -81,13 +107,6 @@ CREATE POLICY "Teachers can view student attempts for their tests"
       AND tests.teacher_id = auth.uid()
     )
   );
-
-DROP POLICY IF EXISTS "Students can manage their own attempts" ON public.test_student_attempts;
-CREATE POLICY "Students can manage their own attempts"
-  ON public.test_student_attempts FOR ALL
-  TO authenticated
-  USING (auth.uid() = student_id)
-  WITH CHECK (auth.uid() = student_id);
 
 -- 5. Student read-only SELECT permissions for tests, subjects, materials, concepts, questions
 DROP POLICY IF EXISTS "Students can view tests they are enrolled in or search by code" ON public.tests;
