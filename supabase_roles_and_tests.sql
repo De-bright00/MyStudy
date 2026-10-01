@@ -65,6 +65,12 @@ create table if not exists public.test_students (
   unique (test_id, student_id)
 );
 
+-- Ensure columns exist even if table was created with older schema
+alter table public.test_students add column if not exists completed boolean not null default false;
+alter table public.test_students add column if not exists score numeric check (score between 0 and 100);
+alter table public.test_students add column if not exists started_at timestamptz default now();
+alter table public.test_students add column if not exists completed_at timestamptz;
+
 alter table public.test_students enable row level security;
 
 -- 5. Create Test Student Attempts Log
@@ -78,6 +84,15 @@ create table if not exists public.test_student_attempts (
   ai_feedback text not null,
   answered_at timestamptz default now()
 );
+
+-- Ensure columns exist even if table was created with older schema
+alter table public.test_student_attempts add column if not exists test_id uuid references public.tests on delete cascade;
+alter table public.test_student_attempts add column if not exists student_id uuid references auth.users on delete cascade;
+alter table public.test_student_attempts add column if not exists question_id uuid references public.questions on delete cascade;
+alter table public.test_student_attempts add column if not exists student_answer text default '';
+alter table public.test_student_attempts add column if not exists is_correct boolean default false;
+alter table public.test_student_attempts add column if not exists ai_feedback text default '';
+alter table public.test_student_attempts add column if not exists answered_at timestamptz default now();
 
 alter table public.test_student_attempts enable row level security;
 

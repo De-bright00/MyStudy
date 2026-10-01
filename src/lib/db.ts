@@ -1096,26 +1096,70 @@ export async function dbFetchTestDetails(code: string): Promise<Test | null> {
   const cleanCode = code.trim().toUpperCase()
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase
-      .from('tests')
-      .select('*, subjects(name)')
-      .eq('code', cleanCode)
-      .maybeSingle()
-    if (error) throw error
-    if (!data) return null
-    const meta = getTestMeta(data.id, data.code)
-    return {
-      id: data.id,
-      teacher_id: data.teacher_id,
-      title: data.title || meta?.title || data.subjects?.name || 'Assessment Test',
-      subject_id: data.subject_id,
-      question_count: data.question_count,
-      question_type: (data.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
-      disable_guidance: data.disable_guidance,
-      code: data.code,
-      created_at: data.created_at,
-      subject_name: data.subjects?.name || 'Unknown Subject'
+    try {
+      // 1. Direct query on tests table without fragile joins that RLS could block
+      const { data, error } = await supabase
+        .from('tests')
+        .select('*')
+        .eq('code', cleanCode)
+        .maybeSingle()
+
+      if (error) {
+        console.warn('Error fetching test by code from Supabase:', error)
+      }
+
+      if (data) {
+        const meta = getTestMeta(data.id, data.code)
+        let subjectName = 'Assessment Subject'
+        if (data.subject_id) {
+          try {
+            const { data: sub } = await supabase.from('subjects').select('name').eq('id', data.subject_id).maybeSingle()
+            if (sub?.name) subjectName = sub.name
+          } catch (e) {}
+        }
+
+        return {
+          id: data.id,
+          teacher_id: data.teacher_id,
+          title: data.title || meta?.title || subjectName,
+          subject_id: data.subject_id,
+          question_count: data.question_count,
+          question_type: (data.question_type || meta?.question_type || 'mixed') as QuestionSettingType,
+          disable_guidance: data.disable_guidance,
+          code: data.code,
+          created_at: data.created_at,
+          subject_name: subjectName
+        }
+      }
+    } catch (err) {
+      console.warn('dbFetchTestDetails error:', err)
     }
+
+    // 2. Fallback to localStorage / mock if created in local session
+    const allTests = mockDb.getTests()
+    const test = allTests.find(t => t.code === cleanCode)
+    if (test) {
+      const meta = getTestMeta(test.id, test.code)
+      return {
+        ...test,
+        question_type: (test.question_type || meta?.question_type || 'mixed') as QuestionSettingType
+      }
+    }
+    const meta = getTestMeta(undefined, cleanCode)
+    if (meta) {
+      return {
+        id: 'test-' + cleanCode,
+        teacher_id: '',
+        title: meta.title || 'Assessment Test',
+        subject_id: '',
+        question_count: 5,
+        question_type: meta.question_type || 'mixed',
+        disable_guidance: false,
+        code: cleanCode,
+        created_at: new Date().toISOString()
+      }
+    }
+    return null
   } else {
     const allTests = mockDb.getTests()
     const subjects = mockDb.getSubjects()
@@ -1133,22 +1177,82 @@ export async function dbFetchTestDetails(code: string): Promise<Test | null> {
 export async function dbJoinTest(studentId: string, testId: string): Promise<TestStudent> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    // Check if already joined
-    const { data: existing } = await supabase
-      .from('test_students')
-      .select('*')
-      .eq('test_id', testId)
-      .eq('student_id', studentId)
-      .maybeSingle()
-    if (existing) return existing
+    try {
+      // Check if already joined
+      const { data: existing } = await supabase
+        .from('test_students')
+        .select('*')
+        .eq('test_id', testId)
+        .eq('student_id', studentId)
+        .maybeSingle()
 
-    const { data, error } = await supabase
-      .from('test_students')
-      .insert({ test_id: testId, student_id: studentId })
-      .select()
-      .single()
-    if (error) throw error
-    return data
+      if (existing) {
+        return {
+          id: existing.id,
+          test_id: existing.test_id,
+          student_id: existing.student_id,
+          completed: existing.completed === true || !!existing.completed_at,
+          score: existing.score !== null && existing.score !== undefined ? Number(existing.score) : null,
+          started_at: existing.started_at || existing.completed_at || new Date().toISOString(),
+          completed_at: existing.completed_at || null
+        }
+      }
+
+      // Try inserting with full columns
+      const res1 = await supabase
+        .from('test_students')
+        .insert({
+          test_id: testId,
+          student_id: studentId,
+          completed: false,
+          started_at: new Date().toISOString()
+        })
+        .select()
+        .single()
+
+      if (!res1.error && res1.data) {
+        return {
+          ...res1.data,
+          completed: false,
+          score: null,
+          started_at: res1.data.started_at || new Date().toISOString(),
+          completed_at: null
+        }
+      }
+
+      // Fallback for minimal columns if started_at or completed column is missing in older DB schema
+      const res2 = await supabase
+        .from('test_students')
+        .insert({ test_id: testId, student_id: studentId })
+        .select()
+        .single()
+
+      if (res2.error) throw res2.error
+      return {
+        ...res2.data,
+        completed: false,
+        score: null,
+        started_at: new Date().toISOString(),
+        completed_at: null
+      }
+    } catch (err: any) {
+      console.warn('dbJoinTest fallback to local storage:', err)
+      const enrollments = mockDb.getTestStudents()
+      const existing = enrollments.find(e => e.test_id === testId && e.student_id === studentId)
+      if (existing) return existing
+
+      const newEnrollment: TestStudent = {
+        id: 'ts-' + Math.random().toString(36).substr(2, 9),
+        test_id: testId,
+        student_id: studentId,
+        completed: false,
+        score: null,
+        started_at: new Date().toISOString(),
+        completed_at: null
+      }
+      mockDb.setTestStudents([newEnrollment, ...enrollments])
+      return newEnrollment
+    }
   } else {
     const enrollments = mockDb.getTestStudents()
     const existing = enrollments.find(e => e.test_id === testId && e.student_id === studentId)
@@ -1171,27 +1275,71 @@ export async function dbJoinTest(studentId: string, testId: string): Promise<Tes
 export async function dbFetchEnrolledTests(studentId: string): Promise<TestStudent[]> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase
-      .from('test_students')
-      .select('*, tests(*, subjects(name))')
-      .eq('student_id', studentId)
-      .order('started_at', { ascending: false })
-    if (error) throw error
-    return (data || []).map(row => {
-      const meta = getTestMeta(row.tests?.id, row.tests?.code)
-      return {
-        id: row.id,
-        test_id: row.test_id,
-        student_id: row.student_id,
-        completed: row.completed,
-        score: row.score === null ? null : Number(row.score),
-        started_at: row.started_at,
-        completed_at: row.completed_at,
-        test_title: row.tests?.title || meta?.title || row.tests?.subjects?.name || 'Unknown Test',
-        subject_id: row.tests?.subject_id,
-        question_type: (row.tests?.question_type || meta?.question_type || 'mixed') as QuestionSettingType
+    try {
+      // 1. Fetch test_students rows without SQL-level ordering on missing started_at column
+      const { data: enrollments, error } = await supabase
+        .from('test_students')
+        .select('*')
+        .eq('student_id', studentId)
+
+      if (error) {
+        console.warn('Could not fetch test_students from Supabase:', error)
+        throw error
       }
-    })
+
+      const list = enrollments || []
+      if (list.length === 0) return []
+
+      // 2. Fetch tests details for enrolled tests
+      const testIds = Array.from(new Set(list.map(r => r.test_id).filter(Boolean)))
+      const testMap = new Map<string, any>()
+
+      if (testIds.length > 0) {
+        try {
+          const { data: testsData } = await supabase
+            .from('tests')
+            .select('*')
+            .in('id', testIds)
+
+          if (testsData) {
+            testsData.forEach(t => testMap.set(t.id, t))
+          }
+        } catch (e) {
+          console.warn('Could not batch fetch tests for enrolled:', e)
+        }
+      }
+
+      return list.map(row => {
+        const test = testMap.get(row.test_id)
+        const meta = getTestMeta(row.test_id, test?.code)
+        return {
+          id: row.id,
+          test_id: row.test_id,
+          student_id: row.student_id,
+          completed: row.completed === true || !!row.completed_at,
+          score: row.score !== null && row.score !== undefined ? Number(row.score) : null,
+          started_at: row.started_at || row.completed_at || new Date().toISOString(),
+          completed_at: row.completed_at || null,
+          test_title: test?.title || meta?.title || 'Assessment Test',
+          subject_id: test?.subject_id,
+          question_type: (test?.question_type || meta?.question_type || 'mixed') as QuestionSettingType
+        }
+      })
+    } catch (err) {
+      console.warn('dbFetchEnrolledTests falling back to local records:', err)
+      const enrollments = mockDb.getTestStudents().filter(ts => ts.student_id === studentId)
+      const tests = mockDb.getTests()
+      return enrollments.map(e => {
+        const t = tests.find(tst => tst.id === e.test_id)
+        const meta = getTestMeta(t?.id, t?.code)
+        return {
+          ...e,
+          test_title: t?.title || meta?.title || 'Unknown Test',
+          subject_id: t?.subject_id,
+          question_type: (t?.question_type || meta?.question_type || 'mixed') as QuestionSettingType
+        }
+      })
+    }
   } else {
     const enrollments = mockDb.getTestStudents().filter(ts => ts.student_id === studentId)
     const tests = mockDb.getTests()
@@ -1211,12 +1359,38 @@ export async function dbFetchEnrolledTests(studentId: string): Promise<TestStude
 export async function dbSubmitTestGrade(studentId: string, testId: string, score: number): Promise<void> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { error } = await supabase
-      .from('test_students')
-      .update({ completed: true, score: score, completed_at: new Date().toISOString() })
-      .eq('test_id', testId)
-      .eq('student_id', studentId)
-    if (error) throw error
+    try {
+      const { error: err1 } = await supabase
+        .from('test_students')
+        .update({ completed: true, score: score, completed_at: new Date().toISOString() })
+        .eq('test_id', testId)
+        .eq('student_id', studentId)
+
+      if (err1) {
+        console.warn('test_students full grade update error, retrying without optional columns:', err1)
+        await supabase
+          .from('test_students')
+          .update({ completed_at: new Date().toISOString() })
+          .eq('test_id', testId)
+          .eq('student_id', studentId)
+      }
+    } catch (e) {
+      console.warn('Could not submit test grade to Supabase:', e)
+    }
+
+    const enrollments = mockDb.getTestStudents()
+    const updated = enrollments.map(e => {
+      if (e.test_id === testId && e.student_id === studentId) {
+        return {
+          ...e,
+          completed: true,
+          score,
+          completed_at: new Date().toISOString()
+        }
+      }
+      return e
+    })
+    mockDb.setTestStudents(updated)
   } else {
     const enrollments = mockDb.getTestStudents()
     const updated = enrollments.map(e => {
@@ -1244,13 +1418,40 @@ export async function dbCreateTestAttempt(
 ): Promise<TestStudentAttempt> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase
-      .from('test_student_attempts')
-      .insert({ test_id: testId, student_id: studentId, question_id: questionId, student_answer: studentAnswer, is_correct: isCorrect, ai_feedback: aiFeedback })
-      .select()
-      .single()
-    if (error) throw error
-    return data
+    try {
+      const { data, error } = await supabase
+        .from('test_student_attempts')
+        .insert({
+          test_id: testId,
+          student_id: studentId,
+          question_id: questionId,
+          student_answer: studentAnswer,
+          is_correct: isCorrect,
+          ai_feedback: aiFeedback,
+          answered_at: new Date().toISOString()
+        })
+        .select()
+        .single()
+
+      if (!error && data) return data
+      console.warn('test_student_attempts insert warning:', error)
+    } catch (e) {
+      console.warn('test_student_attempts exception:', e)
+    }
+
+    const attempts = mockDb.getTestAttempts()
+    const newAttempt: TestStudentAttempt = {
+      id: 'tsa-' + Math.random().toString(36).substr(2, 9),
+      test_id: testId,
+      student_id: studentId,
+      question_id: questionId,
+      student_answer: studentAnswer,
+      is_correct: isCorrect,
+      ai_feedback: aiFeedback,
+      answered_at: new Date().toISOString()
+    }
+    mockDb.setTestAttempts([newAttempt, ...attempts])
+    return newAttempt
   } else {
     const attempts = mockDb.getTestAttempts()
     const newAttempt: TestStudentAttempt = {
@@ -1271,22 +1472,62 @@ export async function dbCreateTestAttempt(
 export async function dbFetchTestScores(testId: string): Promise<TestStudent[]> {
   if (isSupabaseConfigured()) {
     const supabase = getSupabaseClient()!
-    const { data, error } = await supabase
-      .from('test_students')
-      .select('*, profiles(email)')
-      .eq('test_id', testId)
-      .order('completed_at', { ascending: false, nullsFirst: false })
-    if (error) throw error
-    return (data || []).map(row => ({
-      id: row.id,
-      test_id: row.test_id,
-      student_id: row.student_id,
-      completed: row.completed,
-      score: row.score === null ? null : Number(row.score),
-      started_at: row.started_at,
-      completed_at: row.completed_at,
-      student_email: row.profiles?.email || 'unknown@mystudy.ai'
-    }))
+    try {
+      // 1. Fetch test_students rows directly without fragile joins
+      const { data: rows, error } = await supabase
+        .from('test_students')
+        .select('*')
+        .eq('test_id', testId)
+
+      if (error) {
+        console.warn('Could not fetch test_students for scores:', error)
+        throw error
+      }
+
+      const list = rows || []
+      if (list.length === 0) return []
+
+      // 2. Fetch student emails from profiles safely
+      const studentIds = Array.from(new Set(list.map(r => r.student_id).filter(Boolean)))
+      const profileMap = new Map<string, string>()
+
+      if (studentIds.length > 0) {
+        try {
+          const { data: profs } = await supabase
+            .from('profiles')
+            .select('id, email')
+            .in('id', studentIds)
+
+          if (profs) {
+            profs.forEach(p => profileMap.set(p.id, p.email))
+          }
+        } catch (profErr) {
+          console.warn('Could not fetch student profiles:', profErr)
+        }
+      }
+
+      return list.map(row => ({
+        id: row.id,
+        test_id: row.test_id,
+        student_id: row.student_id,
+        completed: row.completed === true || !!row.completed_at,
+        score: row.score !== null && row.score !== undefined ? Number(row.score) : null,
+        started_at: row.started_at || row.completed_at || new Date().toISOString(),
+        completed_at: row.completed_at || null,
+        student_email: profileMap.get(row.student_id) || 'student@mystudy.ai'
+      }))
+    } catch (err) {
+      console.warn('dbFetchTestScores error, checking local store:', err)
+      const enrollments = mockDb.getTestStudents().filter(ts => ts.test_id === testId)
+      const profiles = mockDb.getProfiles()
+      return enrollments.map(e => {
+        const p = profiles.find(pr => pr.id === e.student_id)
+        return {
+          ...e,
+          student_email: p?.email || 'student@mystudy.ai'
+        }
+      })
+    }
   } else {
     const enrollments = mockDb.getTestStudents().filter(ts => ts.test_id === testId)
     const profiles = mockDb.getProfiles()

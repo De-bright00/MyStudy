@@ -26,7 +26,11 @@ import {
   Trash2,
   Sliders,
   CheckCircle,
-  FileCheck
+  FileCheck,
+  Printer,
+  Search,
+  FileSpreadsheet,
+  Users
 } from 'lucide-react'
 
 // Import config and clients
@@ -122,6 +126,264 @@ export default function App() {
   const [newTestQuestionCount, setNewTestQuestionCount] = useState(5)
   const [newTestQuestionType, setNewTestQuestionType] = useState<QuestionSettingType>('mixed')
   const [newTestDisableGuidance, setNewTestDisableGuidance] = useState(false)
+
+  // Scores View & Export State
+  const [viewingTestScores, setViewingTestScores] = useState<{
+    test: Test
+    scores: TestStudent[]
+  } | null>(null)
+  const [isLoadingScores, setIsLoadingScores] = useState<string | null>(null)
+  const [scoresSearchQuery, setScoresSearchQuery] = useState('')
+
+  // Export scores to CSV / Excel
+  const handleExportCSV = (test: Test, scores: TestStudent[]) => {
+    const headers = ['Student Email', 'Status', 'Score (%)', 'Started At', 'Completed At', 'Assessment Title', 'Access Code']
+    const rows = scores.map(s => [
+      `"${(s.student_email || s.student_id).replace(/"/g, '""')}"`,
+      `"${s.completed ? 'Completed' : 'In Progress'}"`,
+      s.completed ? (s.score !== null && s.score !== undefined ? s.score : 0) : 'N/A',
+      `"${s.started_at ? new Date(s.started_at).toLocaleString() : 'N/A'}"`,
+      `"${s.completed_at ? new Date(s.completed_at).toLocaleString() : 'N/A'}"`,
+      `"${(test.title || 'Assessment').replace(/"/g, '""')}"`,
+      `"${test.code}"`
+    ])
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\r\n')
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', `${(test.title || 'assessment').replace(/[^a-zA-Z0-9_-]/g, '_')}_student_scores.csv`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  // Print / Save as PDF or Document report
+  const handlePrintPDF = (test: Test, scores: TestStudent[]) => {
+    const printWindow = window.open('', '_blank', 'width=900,height=700')
+    if (!printWindow) {
+      alert('Pop-up was blocked. Please allow pop-ups to generate PDF report.')
+      return
+    }
+
+    const completedScores = scores.filter(s => s.completed && s.score !== null && s.score !== undefined)
+    const avgScore = completedScores.length > 0 
+      ? Math.round(completedScores.reduce((acc, curr) => acc + Number(curr.score || 0), 0) / completedScores.length) 
+      : 0
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Assessment Report - ${test.title}</title>
+  <style>
+    @media print {
+      body { margin: 20mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1e293b; }
+      .no-print { display: none; }
+      table { page-break-inside: auto; }
+      tr { page-break-inside: avoid; page-break-after: auto; }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #0f172a;
+      line-height: 1.5;
+      padding: 32px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .header {
+      border-bottom: 2px solid #e2e8f0;
+      padding-bottom: 20px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .title {
+      font-size: 24px;
+      font-weight: 800;
+      color: #1e1b4b;
+      margin: 0 0 6px 0;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #64748b;
+      margin: 0;
+    }
+    .badge-code {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #4338ca;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .summary-card {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 14px 18px;
+    }
+    .summary-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .summary-val {
+      font-size: 22px;
+      font-weight: 800;
+      color: #0f172a;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+    th {
+      background: #f1f5f9;
+      text-align: left;
+      padding: 10px 14px;
+      font-weight: 700;
+      color: #334155;
+      border-bottom: 2px solid #cbd5e1;
+    }
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    tr:nth-child(even) {
+      background: #f8fafc;
+    }
+    .score-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .score-high { background: #dcfce7; color: #15803d; }
+    .score-mid { background: #fef9c3; color: #a16207; }
+    .score-low { background: #fee2e2; color: #b91c1c; }
+    .status-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .status-completed { background: #e0e7ff; color: #3730a3; }
+    .status-progress { background: #f1f5f9; color: #64748b; }
+    .btn-print {
+      background: #4f46e5;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 20px;
+    }
+    .footer {
+      margin-top: 40px;
+      border-top: 1px solid #e2e8f0;
+      padding-top: 14px;
+      font-size: 11px;
+      color: #94a3b8;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+  <div class="no-print" style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+    <button class="btn-print" onclick="window.print()">🖨️ Print or Save as PDF</button>
+    <span style="font-size: 12px; color: #64748b;">Tip: Select destination "Save as PDF" in print prompt to download.</span>
+  </div>
+
+  <div class="header">
+    <div>
+      <h1 class="title">${test.title || 'Student Assessment Report'}</h1>
+      <p class="subtitle">Generated on ${new Date().toLocaleDateString(undefined, { dateStyle: 'full' })} at ${new Date().toLocaleTimeString()} • MyStudy Platform</p>
+    </div>
+    <div style="text-align: right;">
+      <div style="font-size: 11px; color: #64748b; margin-bottom: 4px; font-weight: 600;">INVITATION CODE</div>
+      <div class="badge-code">${test.code}</div>
+    </div>
+  </div>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="summary-label">Total Enrolled</div>
+      <div class="summary-val">${scores.length}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Completed</div>
+      <div class="summary-val">${completedScores.length}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">In Progress</div>
+      <div class="summary-val">${scores.length - completedScores.length}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Class Average</div>
+      <div class="summary-val">${avgScore}%</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 5%;">#</th>
+        <th style="width: 45%;">Student Email / Identity</th>
+        <th style="width: 18%;">Status</th>
+        <th style="width: 14%;">Score</th>
+        <th style="width: 18%;">Completed Date</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${scores.length === 0 ? '<tr><td colspan="5" style="text-align: center; padding: 24px; color: #94a3b8;">No students have enrolled or completed this assessment yet.</td></tr>' : ''}
+      ${scores.map((s, idx) => {
+        const isComp = s.completed
+        const scoreVal = s.score !== null && s.score !== undefined ? Number(s.score) : 0
+        const scoreClass = scoreVal >= 70 ? 'score-high' : scoreVal >= 50 ? 'score-mid' : 'score-low'
+        return `
+          <tr>
+            <td>${idx + 1}</td>
+            <td style="font-weight: 600; color: #1e293b;">${s.student_email || s.student_id}</td>
+            <td><span class="status-badge ${isComp ? 'status-completed' : 'status-progress'}">${isComp ? 'Completed' : 'In Progress'}</span></td>
+            <td>${isComp ? `<span class="score-badge ${scoreClass}">${scoreVal}%</span>` : '<span style="color: #94a3b8;">-</span>'}</td>
+            <td style="color: #64748b;">${s.completed_at ? new Date(s.completed_at).toLocaleDateString() + ' ' + new Date(s.completed_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}</td>
+          </tr>
+        `
+      }).join('')}
+    </tbody>
+  </table>
+
+  <div class="footer">
+    <span>Assessment ID: ${test.id}</span>
+    <span>MyStudy Automated Grading & Report</span>
+  </div>
+</body>
+</html>`
+
+    printWindow.document.open()
+    printWindow.document.write(html)
+    printWindow.document.close()
+  }
 
   // Core Data State
   const [subjects, setSubjects] = useState<Subject[]>([])
@@ -3012,24 +3274,30 @@ export default function App() {
 
                     <div className="pt-2 border-t border-slate-100 mt-2">
                       <button
+                        disabled={isLoadingScores === test.id}
                         onClick={async () => {
+                          setIsLoadingScores(test.id)
                           try {
                             const scores = await dbFetchTestScores(test.id)
-                            // Show student results dialog
-                            if (scores.length === 0) {
-                              alert(`No students have taken "${test.title}" yet.\nShare invitation code: ${test.code}`)
-                              return
-                            }
-                            alert(`Loaded student scores for "${test.title}":\n\n` + 
-                              scores.map((s: TestStudent) => `- ${s.student_email}: ${s.completed ? `${s.score}%` : 'In Progress'}`).join('\n')
-                            )
-                          } catch (err) {
-                            alert('Failed to load scores')
+                            setViewingTestScores({ test, scores })
+                            setScoresSearchQuery('')
+                          } catch (err: any) {
+                            console.error('Failed to load scores:', err)
+                            setViewingTestScores({ test, scores: [] })
+                          } finally {
+                            setIsLoadingScores(null)
                           }
                         }}
-                        className="w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-xs font-bold transition-colors cursor-pointer text-center"
+                        className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-xs font-bold transition-colors cursor-pointer text-center flex items-center justify-center gap-1.5 disabled:opacity-50"
                       >
-                        View Student Results & Scores
+                        {isLoadingScores === test.id ? (
+                          <span>Loading Student Scores...</span>
+                        ) : (
+                          <>
+                            <Users className="h-3.5 w-3.5" />
+                            <span>View Student Results & Scores</span>
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
@@ -3256,6 +3524,252 @@ export default function App() {
                   </button>
                 </div>
               </form>
+            </div>
+          </div>
+        )}
+
+        {/* VIEW & EXPORT STUDENT SCORES MODAL */}
+        {viewingTestScores && (
+          <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-3 md:p-6 animate-fadeIn overflow-y-auto">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-4xl w-full my-auto flex flex-col max-h-[90vh] animate-scaleUp overflow-hidden">
+              {/* Modal Header */}
+              <div className="p-5 md:p-6 border-b border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-50/50">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-xl font-bold text-slate-800">
+                      {viewingTestScores.test.title}
+                    </h3>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-600 bg-indigo-50 border border-indigo-100 px-2.5 py-0.5 rounded-full">
+                      Code: {viewingTestScores.test.code}
+                    </span>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full">
+                      {viewingTestScores.test.question_type?.toUpperCase() || 'MIXED'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Student performance overview, score logs, and grade report exports.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap shrink-0">
+                  <button
+                    onClick={() => handleExportCSV(viewingTestScores.test, viewingTestScores.scores)}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer"
+                    title="Export as Excel / CSV spreadsheet"
+                  >
+                    <FileSpreadsheet className="h-4 w-4" />
+                    <span>Export Excel (CSV)</span>
+                  </button>
+
+                  <button
+                    onClick={() => handlePrintPDF(viewingTestScores.test, viewingTestScores.scores)}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm transition-colors cursor-pointer"
+                    title="Print or Save as Document / PDF"
+                  >
+                    <Printer className="h-4 w-4" />
+                    <span>Print / PDF</span>
+                  </button>
+
+                  <button 
+                    onClick={() => setViewingTestScores(null)}
+                    className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+                    aria-label="Close"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Modal Body */}
+              <div className="p-5 md:p-6 overflow-y-auto space-y-5">
+                {/* Summary KPI Cards */}
+                {(() => {
+                  const total = viewingTestScores.scores.length
+                  const completed = viewingTestScores.scores.filter(s => s.completed).length
+                  const inProgress = total - completed
+                  const completedWithScores = viewingTestScores.scores.filter(s => s.completed && s.score !== null && s.score !== undefined)
+                  const avgScore = completedWithScores.length > 0
+                    ? Math.round(completedWithScores.reduce((acc, curr) => acc + Number(curr.score || 0), 0) / completedWithScores.length)
+                    : 0
+
+                  return (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block">Total Enrolled</span>
+                        <span className="text-xl font-black text-slate-800 mt-1 block">{total}</span>
+                      </div>
+                      <div className="bg-emerald-50/60 border border-emerald-200/80 rounded-xl p-3.5">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 block">Completed</span>
+                        <span className="text-xl font-black text-emerald-800 mt-1 block">{completed}</span>
+                      </div>
+                      <div className="bg-amber-50/60 border border-amber-200/80 rounded-xl p-3.5">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700 block">In Progress</span>
+                        <span className="text-xl font-black text-amber-800 mt-1 block">{inProgress}</span>
+                      </div>
+                      <div className="bg-indigo-50/60 border border-indigo-200/80 rounded-xl p-3.5">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-700 block">Class Average</span>
+                        <span className="text-xl font-black text-indigo-900 mt-1 block">{avgScore}%</span>
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Search Bar */}
+                <div className="flex items-center gap-3">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder="Search students by email or status..."
+                      value={scoresSearchQuery}
+                      onChange={(e) => setScoresSearchQuery(e.target.value)}
+                      className="w-full pl-9 pr-4 py-2 border border-slate-200 rounded-xl text-xs font-medium text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                    />
+                  </div>
+                  {scoresSearchQuery && (
+                    <button
+                      onClick={() => setScoresSearchQuery('')}
+                      className="text-xs text-slate-500 hover:text-slate-800 font-semibold cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                {/* Table of Scores */}
+                {(() => {
+                  const filtered = viewingTestScores.scores.filter(s => {
+                    if (!scoresSearchQuery.trim()) return true
+                    const q = scoresSearchQuery.toLowerCase()
+                    const email = (s.student_email || s.student_id).toLowerCase()
+                    const status = s.completed ? 'completed' : 'in progress'
+                    const scoreStr = s.score !== null && s.score !== undefined ? `${s.score}%` : ''
+                    return email.includes(q) || status.includes(q) || scoreStr.includes(q)
+                  })
+
+                  if (viewingTestScores.scores.length === 0) {
+                    return (
+                      <div className="border border-dashed border-slate-200 rounded-2xl p-8 text-center bg-slate-50/50">
+                        <Users className="h-10 w-10 text-slate-300 mx-auto mb-2" />
+                        <h4 className="text-sm font-bold text-slate-700">No students enrolled yet</h4>
+                        <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                          Share the invitation code below with your students so they can join and take this assessment.
+                        </p>
+                        <div className="mt-4 inline-flex items-center gap-3 bg-white border border-slate-200 px-4 py-2 rounded-xl shadow-sm">
+                          <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Code:</span>
+                          <span className="text-base font-black text-indigo-600 tracking-widest">{viewingTestScores.test.code}</span>
+                          <button
+                            onClick={() => {
+                              navigator.clipboard.writeText(viewingTestScores.test.code)
+                              alert(`Code ${viewingTestScores.test.code} copied!`)
+                            }}
+                            className="text-xs font-bold text-slate-600 hover:text-slate-900 ml-1 underline cursor-pointer"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  }
+
+                  if (filtered.length === 0) {
+                    return (
+                      <div className="p-8 text-center text-xs text-slate-500">
+                        No students match "{scoresSearchQuery}".
+                      </div>
+                    )
+                  }
+
+                  return (
+                    <div className="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[10px]">
+                            <tr>
+                              <th className="py-3 px-4">Student</th>
+                              <th className="py-3 px-4">Status</th>
+                              <th className="py-3 px-4">Score</th>
+                              <th className="py-3 px-4 hidden sm:table-cell">Started</th>
+                              <th className="py-3 px-4">Completed</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                            {filtered.map(s => {
+                              const isComp = s.completed
+                              const scoreVal = s.score !== null && s.score !== undefined ? Number(s.score) : 0
+                              const scoreBadgeClass = scoreVal >= 70
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : scoreVal >= 50
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                : 'bg-rose-50 text-rose-700 border-rose-200'
+
+                              return (
+                                <tr key={s.id || s.student_id} className="hover:bg-slate-50/70 transition-colors">
+                                  <td className="py-3 px-4">
+                                    <div className="flex items-center gap-2">
+                                      <div className="h-7 w-7 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-xs shrink-0">
+                                        {(s.student_email || 'S')[0].toUpperCase()}
+                                      </div>
+                                      <div className="truncate max-w-[200px] md:max-w-xs font-semibold text-slate-900">
+                                        {s.student_email || s.student_id}
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    {isComp ? (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-100">
+                                        <CheckCircle2 className="h-3 w-3 text-indigo-600" />
+                                        Completed
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                                        <Clock className="h-3 w-3 text-slate-400" />
+                                        In Progress
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    {isComp ? (
+                                      <span className={`inline-block px-2.5 py-0.5 rounded-lg text-xs font-black border ${scoreBadgeClass}`}>
+                                        {scoreVal}%
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-400 font-bold">-</span>
+                                    )}
+                                  </td>
+                                  <td className="py-3 px-4 text-slate-500 hidden sm:table-cell">
+                                    {s.started_at ? new Date(s.started_at).toLocaleDateString() : '-'}
+                                  </td>
+                                  <td className="py-3 px-4 text-slate-500">
+                                    {s.completed_at ? (
+                                      <span>
+                                        {new Date(s.completed_at).toLocaleDateString()} {new Date(s.completed_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                      </span>
+                                    ) : '-'}
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )
+                })()}
+              </div>
+
+              {/* Modal Footer */}
+              <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+                <span className="text-xs text-slate-500">
+                  Showing {viewingTestScores.scores.length} student submission(s)
+                </span>
+                <button
+                  onClick={() => setViewingTestScores(null)}
+                  className="px-4 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-colors shadow-sm cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         )}
